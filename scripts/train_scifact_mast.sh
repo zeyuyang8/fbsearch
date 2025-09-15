@@ -13,7 +13,7 @@ elif [[ "$TORCHXCONFIG" == *"h100"* ]]; then
 fi
 
 # Run the MAST job - component args BEFORE --, script args AFTER --
-torchx run mast.py:train \
+with-proxy torchx run mast.py:train \
     --h $HTYPE \
     --nnodes 2 \
     --nproc_per_node 8 \
