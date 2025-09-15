@@ -4,6 +4,7 @@ hpcIdentity = genai_web_search_data_project
 hpcJobOncall = mase_relevance
 workspace_fbpkg_name = metaconda_demo
 forceSingleRegion = False
+use_caf = False
 
 [cli:run]
 scheduler = mast_conda

@@ -1,8 +1,8 @@
 #!/usr/bin/bash
 
 # Here are 2 variables to configure
-export TORCHXCONFIG="./.torchxconfig.h100"  # ? a100 and h100 can be used interchangeably here
-export NAME="h100test"  # ? Configure this to be the name of the job
+export TORCHXCONFIG="./.torchxconfig.a100"  # ? a100 and h100 can be used interchangeably here
+export NAME="test"  # ? Configure this to be the name of the job
 
 export HTYPE="grandteton"
 # Based on the configuration, determine the hardware type
