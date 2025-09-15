@@ -1,0 +1,31 @@
+# LLM
+torch
+transformers
+datasets
+sentencepiece
+wandb
+trl
+
+# Jupyter
+ipykernel
+ipywidgets
+pyrefly
+
+# Compute
+numpy
+
+# Visualization
+matplotlib
+seaborn
+graphviz
+plotly
+anytree
+
+# GPU
+gpustat
+
+# MTEB
+mteb
+
+# Data
+recordlinkage

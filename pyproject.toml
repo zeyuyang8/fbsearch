@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pyrefly]
+project-includes = ["**/*"]
+project-excludes = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/*venv/**/*",
+]
+disable_type_errors_in_ide = true
+site-package-path = [
+    "/home/zy45/.conda/envs/fbs/lib/python3.12/site-packages",
+    "/home/zy45/.local/lib/python3.12/site-packages"
+]
+
+[tool.pyrefly.errors]
+not-iterateable = false
