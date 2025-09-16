@@ -17,7 +17,7 @@ with-proxy torchx run mast.py:train \
     --h $HTYPE \
     --nnodes 2 \
     --nproc_per_node 8 \
-    --script train.py \
+    --script train_scifact.py \
     --name $NAME \
     -- \
     --gradient_accumulation_steps=1  # ? Configure this for your train scripts

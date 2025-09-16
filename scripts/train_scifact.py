@@ -17,13 +17,94 @@ from accelerate.utils import (
     set_seed,
 )
 from genx.const import TRANSFORMERS_PATH_MAP
-from genx.dataset.scifact import get_scifact_dataloader
+from genx.dataset.scifact import get_scifact_dataloader, scifact_collate_fn
 from genx.model.llama import GenXTransformer, get_genx_transformer
+from genx.model.store import Document, SequencePrefixTreeIndexStore
 from torch.optim import AdamW
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 from transformers import get_scheduler, HfArgumentParser
 
 logger = get_logger(__name__)
+
+
+def log_validation(store, scifact_dataloader, accelerator, epoch, split: str):
+    cited_doc_ids = []
+    results = []
+
+    for batch in scifact_dataloader:
+        # Use dict to automatically handle duplicates (keeps last occurrence)
+        unique_queries = {}
+        for query, doc_id in zip(batch["query"], batch["doc_id"]):
+            if query not in unique_queries:
+                unique_queries[query] = []
+            unique_queries[query].append(doc_id)
+
+        queries_to_be_queried = []
+        doc_ids_for_a_query = []
+        for query, doc_ids in unique_queries.items():
+            queries_to_be_queried.append(Document(query, {"doc_ids": doc_ids}))
+            doc_ids_for_a_query.append(doc_ids)
+
+        result = store.query(queries_to_be_queried)
+        results.extend(result)
+        cited_doc_ids.extend(doc_ids_for_a_query)
+
+    assert len(results) == len(cited_doc_ids)
+
+    total_predicted = 0
+    total_correctly_predicted = 0
+    total_gold = 0
+
+    for idx in range(len(results)):
+        result = results[idx]
+        cited_doc_id = cited_doc_ids[idx]
+
+        # Extract predicted document IDs
+        if len(result) > 0:
+            temp = []
+            for item in result:
+                temp.extend(item["doc_ids"])
+            predicted = set(temp)
+        else:
+            predicted = set()
+
+        # Count metrics
+        total_predicted += len(predicted)
+        total_gold += len(cited_doc_id)
+
+        # Count correctly predicted abstracts (intersection)
+        correctly_predicted = predicted.intersection(set(cited_doc_id))
+        total_correctly_predicted += len(correctly_predicted)
+
+    # Calculate precision and recall
+    if total_predicted > 0:
+        precision = total_correctly_predicted / total_predicted
+    else:
+        precision = 0.0
+
+    if total_gold > 0:
+        recall = total_correctly_predicted / total_gold
+    else:
+        recall = 0.0
+
+    # Calculate F1 score
+    if precision + recall > 0:
+        f1_score = 2 * (precision * recall) / (precision + recall)
+    else:
+        f1_score = 0.0
+
+    # Log results
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    "epoch": epoch,
+                    f"{split}-precision": precision,
+                    f"{split}-recall": recall,
+                    f"{split}-f1": f1_score,
+                }
+            )
 
 
 @dataclass
@@ -36,10 +117,23 @@ class Arguments:
     torch_dtype: str = field(default="bfloat16")
 
     # Indexing
+    num_beams: int = field(default=3)
     num_next_tokens: int = field(default=5)
+    insertion_depth: int = field(default=4)
 
     # Prompts
-    doc_prompt_before: str = field(default="")
+    doc_prompt_before: str = field(
+        default="Generate identifying phrases that memorize the key concepts in this text. You are not supposed to make sense. Just generate ONLY the identifying phrases without any punctuations or numbers before or after. "
+    )
+    doc_prompt_after: str = field(default=" IGNORE ME. Phrases: ")
+    query_prompt_before: str = field(
+        default="From this query create identifying phrases that capture the key concepts and align with phrases found in relevant text. Do not aim for meaningful sentences. Only output the identifying phrases with no punctuation or numbers before or after. "
+    )
+    query_prompt_after: str = field(default=" IGNORE ME. Phrases: ")
+    duplicate_prompt_before: str = field(
+        default="Given the text first remove all the punctuations and stop words. Then shuffle the sentences. Generate some unique related phrases that does not have synonyms. "
+    )
+    duplicate_prompt_after: str = field(default=" IGNORE ME. Phrases: ")
 
     # Data
     data_path: str = field(default="/home/zy45/code/genx/scripts/data/scifact")
@@ -49,7 +143,7 @@ class Arguments:
     corpus_filename: str = field(default="corpus.jsonl")
 
     # Logging
-    output_dir: str = field(default="./runs")
+    output_dir: str = field(default="./runs/scifact/train-on-real")
     logging_dir: str = field(default="logs")
     tracker_name: str = field(default="test")
 
@@ -70,7 +164,7 @@ class Arguments:
     lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
     num_train_epochs: int = field(default=10)
-    learning_rate: float = field(default=1e-5)
+    learning_rate: float = field(default=1e-4)
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
     adam_epsilon: float = field(default=1e-8)
@@ -78,10 +172,11 @@ class Arguments:
     max_grad_norm: float = field(default=1.0)
     dataloader_num_workers: int = field(default=4)
     validation_epochs: int = field(default=1)
+    train_on_syn_data: bool = field(default=False)
 
     # Resume checkpoint
     resume_from_checkpoint: str = field(default=None)
-    checkpointing_steps: int = field(default=1000)
+    checkpointing_epochs: int = field(default=5)
 
 
 def ddp_process(args):
@@ -127,11 +222,41 @@ def ddp_process(args):
     corpus_path = os.path.join(data_path, args.corpus_filename)
 
     per_device_train_batch_size = args.per_device_train_batch_size
-    train_dataloader = get_scifact_dataloader(
+    real_train_dataloader = get_scifact_dataloader(
         queries_path=train_queries_path,
         corpus_path=corpus_path,
         batch_size=per_device_train_batch_size,
         shuffle=True,
+        num_workers=args.dataloader_num_workers,
+    )
+    if args.train_on_syn_data:
+        assert "train-on-syn" in args.output_dir
+        syn_dataloader = get_scifact_dataloader(
+            queries_path=os.path.join(data_path, args.syn_queries_filename),
+            corpus_path=corpus_path,
+            batch_size=per_device_train_batch_size,
+            shuffle=True,
+            num_workers=args.dataloader_num_workers,
+        )
+        syn_dataset = syn_dataloader.dataset
+        train_dataset = real_train_dataloader.dataset
+        combined_dataset = ConcatDataset([syn_dataset, train_dataset])
+        train_dataloader = DataLoader(
+            combined_dataset,
+            batch_size=per_device_train_batch_size,
+            collate_fn=scifact_collate_fn,
+            shuffle=True,
+            num_workers=args.dataloader_num_workers,
+        )
+    else:
+        assert "train-on-real" in args.output_dir
+        train_dataloader = real_train_dataloader
+
+    dev_dataloader = get_scifact_dataloader(
+        queries_path=os.path.join(data_path, args.dev_queries_filename),
+        corpus_path=corpus_path,
+        batch_size=per_device_train_batch_size,
+        shuffle=False,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -147,6 +272,8 @@ def ddp_process(args):
         doc_model_name_or_path=doc_model_name_or_path,
         query_model_max_length=args.query_model_max_length,
         doc_model_max_length=args.doc_model_max_length,
+        num_beams=args.num_beams,
+        num_next_tokens=args.num_next_tokens,
         torch_dtype=torch_dtype,
     )
     query_model, doc_model = genx_transformer.query_model, genx_transformer.doc_model
@@ -213,6 +340,22 @@ def ddp_process(args):
         tracker_name = args.tracker_name
         accelerator.init_trackers(tracker_name, config=vars(args))
 
+    # TODO: later, we will also train the document model such that it can generate diverse phrases
+    # Before training, first insert real data into data store since we are not training the document model, only the query model
+    if accelerator.is_main_process:
+        logger.info("Inserting real training data into data store...")
+        store = SequencePrefixTreeIndexStore(
+            genx_transformer,
+            id_len=args.num_next_tokens,
+            universe=set(range(genx_transformer.doc_tokenizer.vocab_size)),
+            mode="document_search",
+            insertion_depth=args.insertion_depth,
+        )
+        store.clear_store()
+        store.set_verbose_for_all(False)
+        # TODO: Insert all corpus documents into the store
+        ...
+
     # Log some info about our training
     total_batch_size = (
         per_device_train_batch_size
@@ -229,7 +372,10 @@ def ddp_process(args):
         f"Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
     logger.info(f"Gradient accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"Number of update steps per epoch = {num_update_steps_per_epoch}")
     logger.info(f"Total optimization steps = {max_train_steps}")
+    logger.info(f"Checkpointing epochs = {args.checkpointing_epochs}")
+    checkpointing_steps = args.checkpointing_epochs * num_update_steps_per_epoch
     global_step = 0
     first_epoch = 0
 
@@ -291,7 +437,7 @@ def ddp_process(args):
                 global_step += 1
 
                 if accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
+                    if global_step % checkpointing_steps == 0:
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{global_step}"
                         )
@@ -308,8 +454,10 @@ def ddp_process(args):
         # Validate!
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
-                # log_validation(...)
-                ...  # TODO: Add validation here
+                log_validation(
+                    store, real_train_dataloader, accelerator, epoch, split="train"
+                )
+                log_validation(store, dev_dataloader, accelerator, epoch, split="dev")
 
     # Evaluate!
     accelerator.wait_for_everyone()

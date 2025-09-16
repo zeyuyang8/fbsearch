@@ -3,5 +3,6 @@ __pycache__
 
 wandb
 runs
+data
 
 mast.py

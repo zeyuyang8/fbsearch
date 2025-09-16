@@ -77,7 +77,7 @@ def get_genx_transformer(
     query_model_max_length=128,
     doc_model_max_length=512,
     num_beams: int = 5,
-    num_tokens: int = 5,
+    num_next_tokens: int = 5,
     torch_dtype=torch.bfloat16,
 ):
     query_model, query_tokenizer = get_model_and_tokenizer(
@@ -96,7 +96,7 @@ def get_genx_transformer(
         query_tokenizer=query_tokenizer,
         doc_tokenizer=doc_tokenizer,
         num_beams=num_beams,
-        num_tokens=num_tokens,
+        num_next_tokens=num_next_tokens,
     )
 
 
@@ -108,24 +108,33 @@ class GenXTransformer:
         query_tokenizer,
         doc_tokenizer,
         num_beams: int = 5,
-        num_tokens: int = 5,
+        num_next_tokens: int = 5,
+        freeze_doc_model: bool = True,
     ):
         super().__init__()
         self.query_model = query_model
         self.doc_model = doc_model
 
-        self.query_model.train()
-        self.doc_model.eval()
+        # Use cache
+        self.query_model.config.use_cache = True
+        self.doc_model.config.use_cache = True
 
         self.query_tokenizer = query_tokenizer
         self.doc_tokenizer = doc_tokenizer
 
         self.num_beams = num_beams
-        self.num_tokens = num_tokens
+        self.num_next_tokens = num_next_tokens
 
         self.verbose = False
 
-        self.config_genx_gen_kwargs(num_beams=num_beams, num_tokens=num_tokens)
+        self.config_genx_gen_kwargs(
+            num_beams=num_beams,
+            num_return_sequences=num_beams,
+            num_next_tokens=num_next_tokens,
+        )
+
+        self.freeze_doc_model = freeze_doc_model
+        self.cache = {}
 
     def set_train_eval_mode(self, query_train: bool = True, doc_train: bool = False):
         if query_train:
@@ -137,12 +146,13 @@ class GenXTransformer:
         else:
             self.doc_model.eval()
 
+    def update_num_next_tokens(self, num_next_tokens: int):
+        self.num_next_tokens = num_next_tokens
+        self.genx_gen_kwargs["max_new_tokens"] = num_next_tokens
+
     def config_genx_gen_kwargs(self, **kwargs):
         gen_kwargs = {
             "max_new_tokens": kwargs.get("max_new_tokens", 5),
-            # "temperature": kwargs.get("temperature", 0.7),
-            # "top_k": kwargs.get("top_k", 30),
-            # "top_p": kwargs.get("top_p", 0.95),
             "do_sample": False,
             "num_beams": kwargs.get("num_beams", 5),
             "num_return_sequences": kwargs.get("num_return_sequences", 5),
@@ -150,6 +160,48 @@ class GenXTransformer:
             "pad_token_id": kwargs.get("pad_token_id", None),
         }
         self.genx_gen_kwargs = gen_kwargs
+
+    def index_prompt(self, prompts, model, tokenizer):
+        device = model.device
+
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        batch = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="longest",
+        )
+        batch["input_len"] = len(batch["input_ids"][0])
+
+        genx_gen_kwargs = self.genx_gen_kwargs.copy()
+        with torch.no_grad():
+            genx_gen_kwargs["input_ids"] = batch["input_ids"].to(device)
+            genx_gen_kwargs["attention_mask"] = batch["attention_mask"].to(device)
+            generated_tokens = model.generate(**genx_gen_kwargs)
+
+        input_len = batch["input_len"]
+        pred_next_tokens = generated_tokens[:, input_len:]
+        if self.verbose:
+            print(
+                "Decoded tokens:",
+                tokenizer.batch_decode(pred_next_tokens, skip_special_tokens=False),
+            )
+
+        batch_size = len(prompts)
+        num_return_sequences = genx_gen_kwargs["num_return_sequences"]
+
+        pred_next_tokens = pred_next_tokens.view(batch_size, num_return_sequences, -1)
+        pred_next_tokens = pred_next_tokens.cpu().tolist()
+
+        print("Token IDs:", pred_next_tokens) if self.verbose else None
+        return pred_next_tokens
+
+    def index_query(self, prompts: list[str]):
+        return self.index_prompt(prompts, self.query_model, self.query_tokenizer)
+
+    def index_doc(self, prompts: list[str]):
+        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer)
 
     def sample_beams_of_next_tokens(
         self,
@@ -217,12 +269,12 @@ class GenXTransformer:
             self.doc_model,
             self.doc_tokenizer,
             docs,
-        )  # Shape is num_docs x num_beams x num_tokens
+        )  # Shape is num_docs x num_beams x num_next_tokens
 
-        # Shape is num_docs x num_beams x (len(query) + num_tokens)
+        # Shape is num_docs x num_beams x (len(query) + num_next_tokens)
         prompts_for_all_pairs: list[list[str]] = []
         for doc_idx, beams in enumerate(beams_for_docs):
-            beams = self.doc_tokenizer.batch_decode(beams, skip_special_tokens=True)
+            beams = self.doc_tokenizer.batch_decode(beams, skip_special_tokens=False)
             prompts = []  # List of the same query and num_beams possible next sentences
 
             query = queries[doc_idx]
@@ -233,7 +285,7 @@ class GenXTransformer:
 
             prompts_for_all_pairs.append(prompts)
 
-        # Have num_docs x num_beams sequences, each of a string of length (len(query) + num_tokens)
+        # Have num_docs x num_beams sequences, each of a string of length (len(query) + num_next_tokens)
         flats: list[str] = list(itertools.chain.from_iterable(prompts_for_all_pairs))
 
         loss = self.get_sft_loss_txt(self.query_model, self.query_tokenizer, flats)
