@@ -4,5 +4,6 @@ __pycache__
 wandb
 runs
 data
+notebooks
 
 mast.py

@@ -17,18 +17,25 @@ from accelerate.utils import (
     set_seed,
 )
 from genx.const import TRANSFORMERS_PATH_MAP
-from genx.dataset.scifact import get_scifact_dataloader, scifact_collate_fn
+from genx.dataset.scifact import get_scifact_query_dataloader, SciFactCorpusDataset
 from genx.model.llama import GenXTransformer, get_genx_transformer
 from genx.model.store import Document, SequencePrefixTreeIndexStore
 from torch.optim import AdamW
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_scheduler, HfArgumentParser
 
 logger = get_logger(__name__)
 
 
-def log_validation(store, scifact_dataloader, accelerator, epoch, split: str):
+def log_validation(
+    store,
+    scifact_dataloader,
+    accelerator,
+    epoch,
+    split: str,
+    is_final_validation: bool = False,
+):
     cited_doc_ids = []
     results = []
 
@@ -95,14 +102,17 @@ def log_validation(store, scifact_dataloader, accelerator, epoch, split: str):
         f1_score = 0.0
 
     # Log results
+    flag = split
+    if is_final_validation:
+        flag = f"final-{split}"
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             tracker.log(
                 {
                     "epoch": epoch,
-                    f"{split}-precision": precision,
-                    f"{split}-recall": recall,
-                    f"{split}-f1": f1_score,
+                    f"{flag}-precision": precision,
+                    f"{flag}-recall": recall,
+                    f"{flag}-f1": f1_score,
                 }
             )
 
@@ -219,32 +229,36 @@ def ddp_process(args):
     # Data
     data_path = args.data_path
     train_queries_path = os.path.join(data_path, args.train_queries_filename)
+    syn_queries_path = os.path.join(data_path, args.syn_queries_filename)
+    dev_queries_path = os.path.join(data_path, args.dev_queries_filename)
     corpus_path = os.path.join(data_path, args.corpus_filename)
 
     per_device_train_batch_size = args.per_device_train_batch_size
-    real_train_dataloader = get_scifact_dataloader(
+
+    # Corpus
+    corpus_dataset = SciFactCorpusDataset(corpus_path)
+    corpus_dataloader = DataLoader(
+        corpus_dataset,
+        batch_size=per_device_train_batch_size,
+        shuffle=False,
+        num_workers=args.dataloader_num_workers,
+    )
+    corpus_dict = corpus_dataset.get_corpus_dict()
+
+    # Queries
+    real_train_dataloader = get_scifact_query_dataloader(
         queries_path=train_queries_path,
-        corpus_path=corpus_path,
+        corpus_dict=corpus_dict,
         batch_size=per_device_train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
     )
     if args.train_on_syn_data:
         assert "train-on-syn" in args.output_dir
-        syn_dataloader = get_scifact_dataloader(
-            queries_path=os.path.join(data_path, args.syn_queries_filename),
-            corpus_path=corpus_path,
+        train_dataloader = get_scifact_query_dataloader(
+            queries_path=[syn_queries_path, train_queries_path],
+            corpus_dict=corpus_dict,
             batch_size=per_device_train_batch_size,
-            shuffle=True,
-            num_workers=args.dataloader_num_workers,
-        )
-        syn_dataset = syn_dataloader.dataset
-        train_dataset = real_train_dataloader.dataset
-        combined_dataset = ConcatDataset([syn_dataset, train_dataset])
-        train_dataloader = DataLoader(
-            combined_dataset,
-            batch_size=per_device_train_batch_size,
-            collate_fn=scifact_collate_fn,
             shuffle=True,
             num_workers=args.dataloader_num_workers,
         )
@@ -252,9 +266,9 @@ def ddp_process(args):
         assert "train-on-real" in args.output_dir
         train_dataloader = real_train_dataloader
 
-    dev_dataloader = get_scifact_dataloader(
-        queries_path=os.path.join(data_path, args.dev_queries_filename),
-        corpus_path=corpus_path,
+    dev_dataloader = get_scifact_query_dataloader(
+        queries_path=dev_queries_path,
+        corpus_dict=corpus_dict,
         batch_size=per_device_train_batch_size,
         shuffle=False,
         num_workers=args.dataloader_num_workers,
@@ -353,8 +367,15 @@ def ddp_process(args):
         )
         store.clear_store()
         store.set_verbose_for_all(False)
-        # TODO: Insert all corpus documents into the store
-        ...
+
+        logger.info("Inserting corpus into data store...")
+        for batch in corpus_dataloader:
+            doc_ids = batch["doc_id"]
+            texts = batch["text"]
+            to_be_inserted = []
+            for doc_id, text in zip(doc_ids, texts):
+                to_be_inserted.append(Document(text, {"doc_id": doc_id}))
+            store.insert(to_be_inserted)
 
     # Log some info about our training
     total_batch_size = (
@@ -455,14 +476,41 @@ def ddp_process(args):
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
                 log_validation(
-                    store, real_train_dataloader, accelerator, epoch, split="train"
+                    store,
+                    real_train_dataloader,
+                    accelerator,
+                    epoch,
+                    split="train",
+                    is_final_validation=False,
                 )
-                log_validation(store, dev_dataloader, accelerator, epoch, split="dev")
+                log_validation(
+                    store,
+                    dev_dataloader,
+                    accelerator,
+                    epoch,
+                    split="dev",
+                    is_final_validation=False,
+                )
 
     # Evaluate!
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        ...  # TODO: Final evaluation and push to HF if needed
+        log_validation(
+            store,
+            real_train_dataloader,
+            accelerator,
+            epoch,
+            split="train",
+            is_final_validation=True,
+        )
+        log_validation(
+            store,
+            dev_dataloader,
+            accelerator,
+            epoch,
+            split="dev",
+            is_final_validation=True,
+        )
 
     # Finish
     accelerator.end_training()
