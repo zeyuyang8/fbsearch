@@ -109,7 +109,7 @@ class GenXTransformer:
         doc_tokenizer,
         num_beams: int = 5,
         num_next_tokens: int = 5,
-        freeze_doc_model: bool = True,
+        save_cache: bool = False,
     ):
         super().__init__()
         self.query_model = query_model
@@ -133,7 +133,7 @@ class GenXTransformer:
             num_next_tokens=num_next_tokens,
         )
 
-        self.freeze_doc_model = freeze_doc_model
+        self.save_cache = save_cache
         self.cache = {}
 
     def set_train_eval_mode(self, query_train: bool = True, doc_train: bool = False):
@@ -252,6 +252,16 @@ class GenXTransformer:
         input_ids = tokens["input_ids"]
         attention_mask = tokens["attention_mask"]
         labels = input_ids.clone()
+
+        # Mask out all but last 5 tokens
+        # shape: (batch_size, seq_len)
+        batch_size, seq_len = input_ids.size()
+        keep = self.num_next_tokens
+        mask = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(
+            batch_size, -1
+        ) < (seq_len - keep)
+
+        labels[mask] = -100  # -100 tells HF loss function to ignore those positions
 
         outputs = model(
             input_ids=input_ids,

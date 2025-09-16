@@ -34,6 +34,7 @@ def log_validation(
     accelerator,
     epoch,
     split: str,
+    global_step: int,
     is_final_validation: bool = False,
 ):
     cited_doc_ids = []
@@ -113,7 +114,8 @@ def log_validation(
                     f"{flag}-precision": precision,
                     f"{flag}-recall": recall,
                     f"{flag}-f1": f1_score,
-                }
+                },
+                step=global_step,
             )
 
 
@@ -127,9 +129,9 @@ class Arguments:
     torch_dtype: str = field(default="bfloat16")
 
     # Indexing
-    num_beams: int = field(default=3)
+    num_beams: int = field(default=1)
     num_next_tokens: int = field(default=5)
-    insertion_depth: int = field(default=4)
+    insertion_depth: int = field(default=5)
 
     # Prompts
     doc_prompt_before: str = field(
@@ -181,7 +183,7 @@ class Arguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     dataloader_num_workers: int = field(default=4)
-    validation_epochs: int = field(default=1)
+    validation_epochs: int = field(default=5)
     train_on_syn_data: bool = field(default=False)
 
     # Resume checkpoint
@@ -357,7 +359,6 @@ def ddp_process(args):
     # TODO: later, we will also train the document model such that it can generate diverse phrases
     # Before training, first insert real data into data store since we are not training the document model, only the query model
     if accelerator.is_main_process:
-        logger.info("Inserting real training data into data store...")
         store = SequencePrefixTreeIndexStore(
             genx_transformer,
             id_len=args.num_next_tokens,
@@ -396,6 +397,7 @@ def ddp_process(args):
     logger.info(f"Number of update steps per epoch = {num_update_steps_per_epoch}")
     logger.info(f"Total optimization steps = {max_train_steps}")
     logger.info(f"Checkpointing epochs = {args.checkpointing_epochs}")
+    logger.info(f"Validation epochs = {args.validation_epochs}")
     checkpointing_steps = args.checkpointing_epochs * num_update_steps_per_epoch
     global_step = 0
     first_epoch = 0
@@ -481,6 +483,7 @@ def ddp_process(args):
                     accelerator,
                     epoch,
                     split="train",
+                    global_step=global_step,
                     is_final_validation=False,
                 )
                 log_validation(
@@ -489,6 +492,7 @@ def ddp_process(args):
                     accelerator,
                     epoch,
                     split="dev",
+                    global_step=global_step,
                     is_final_validation=False,
                 )
 
@@ -501,6 +505,7 @@ def ddp_process(args):
             accelerator,
             epoch,
             split="train",
+            global_step=global_step,
             is_final_validation=True,
         )
         log_validation(
@@ -509,6 +514,7 @@ def ddp_process(args):
             accelerator,
             epoch,
             split="dev",
+            global_step=global_step,
             is_final_validation=True,
         )
 
