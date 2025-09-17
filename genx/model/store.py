@@ -27,6 +27,7 @@ class IndexStoreTemplate(ABC):
         self.size = 0
         self._ids = np.zeros(self.capacity, dtype=np.int64)
         self._data_store = {}  # Dictionary to store actual data
+        self._beams_store = {}  # Dictionary to store beams of sequences for each doc
 
     def _resize_if_needed(self, additional_items=16):
         if self.size + additional_items > self.capacity:
@@ -49,6 +50,9 @@ class IndexStoreTemplate(ABC):
     def retrieve(self, doc_id):
         return self._data_store[doc_id]
 
+    def get_beams_by_doc_id(self, doc_id):
+        return self._beams_store[doc_id]
+
     @abstractmethod
     def insert(self, text: list[Document]):
         pass
@@ -69,7 +73,7 @@ class Prompt:
         self.before = before
         self.after = after
 
-    def template(self, text):
+    def format(self, text):
         return self.before + text + self.after
 
 
@@ -79,8 +83,8 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
         transformer,
         id_len,
         universe,
-        doc_prompt,
-        query_prompt,
+        doc_prompt: Prompt,
+        query_prompt: Prompt,
         verbose=False,
         initial_capacity=1000,
         insertion_depth=3,
@@ -154,6 +158,9 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
         self, lst_of_sequences: list[list[list[int]]], doc_ids: list[int]
     ):
         for sequences, doc_id in zip(lst_of_sequences, doc_ids):
+            # Store sequences of a doc in to database
+            self._beams_store[doc_id] = sequences
+
             for seq in sequences:
                 print(f"Tokens: {seq}") if self.verbose else None
                 if len(seq) != self.id_len or not all(x in self.universe for x in seq):
@@ -177,7 +184,7 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
 
     def insert(self, texts: list[Document]):
         print(f"Inserting '{texts}'") if self.verbose else None
-        self._insert_document(texts, self.doc_prompt.template)
+        self._insert_document(texts, self.doc_prompt.format)
 
     def _query_with_prompt(self, query_texts: list[Document], prompt_template):
         if not query_texts:
@@ -231,4 +238,4 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
 
     def query(self, query_texts: list[Document]):
         print(f"Querying for '{query_texts}'") if self.verbose else None
-        return self._query_with_prompt(query_texts, self.query_prompt.template)
+        return self._query_with_prompt(query_texts, self.query_prompt.format)

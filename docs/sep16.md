@@ -1,0 +1,1 @@
+[Page - Train Open Source Models Internally](https://www.internalfb.com/wiki/Monetization_Ranking_&_AI_team_Landing/Teams/Ads_Data_and_Representation_Learning/Ads_Content_Understanding/Resources/Train_Open_Source_Models_on_Devserver/)

@@ -31,11 +31,6 @@ logger = get_logger(__name__)
 def log_validation(
     store,
     scifact_dataloader,
-    accelerator,
-    epoch,
-    split: str,
-    global_step: int,
-    is_final_validation: bool = False,
 ):
     cited_doc_ids = []
     results = []
@@ -58,6 +53,8 @@ def log_validation(
         results.extend(result)
         cited_doc_ids.extend(doc_ids_for_a_query)
 
+    print(results)
+    print(cited_doc_ids)
     assert len(results) == len(cited_doc_ids)
 
     total_predicted = 0
@@ -76,6 +73,16 @@ def log_validation(
             predicted = set(temp)
         else:
             predicted = set()
+
+        predicted = list(predicted)
+        for idx, pred in enumerate(predicted):
+            predicted[idx] = int(store._data_store[pred].get_metadata()["doc_id"])
+
+        cited_doc_id = set(cited_doc_id)
+        predicted = set(predicted)
+
+        print(f"True {cited_doc_id}")
+        print(f"Pred {predicted}")
 
         # Count metrics
         total_predicted += len(predicted)
@@ -102,21 +109,11 @@ def log_validation(
     else:
         f1_score = 0.0
 
-    # Log results
-    flag = split
-    if is_final_validation:
-        flag = f"final-{split}"
-    for tracker in accelerator.trackers:
-        if tracker.name == "wandb":
-            tracker.log(
-                {
-                    "epoch": epoch,
-                    f"{flag}-precision": precision,
-                    f"{flag}-recall": recall,
-                    f"{flag}-f1": f1_score,
-                },
-                step=global_step,
-            )
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+    }
 
 
 @dataclass
@@ -176,7 +173,7 @@ class Arguments:
     lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
     num_train_epochs: int = field(default=10)
-    learning_rate: float = field(default=1e-4)
+    learning_rate: float = field(default=5e-5)
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
     adam_epsilon: float = field(default=1e-8)
@@ -241,11 +238,11 @@ def ddp_process(args):
     corpus_prompt_template = Prompt(
         before=args.doc_prompt_before,
         after=args.doc_prompt_after,
-    ).template
+    )
     query_prompt_template = Prompt(
         before=args.query_prompt_before,
         after=args.query_prompt_after,
-    ).template
+    )
 
     # Corpus
     corpus_dataset = SciFactCorpusDataset(
@@ -456,10 +453,14 @@ def ddp_process(args):
         for _, batch in enumerate(train_dataloader):
             models_to_accumulate = [query_model]
             with accelerator.accumulate(models_to_accumulate):
+                doc_ids = batch["doc_id"]
                 queries = batch["query"]
                 docs = batch["text"]
-                docs = [corpus_prompt_template(text) for text in docs]
-                queries = [query_prompt_template(query) for query in queries]
+                docs = [corpus_prompt_template.format(text) for text in docs]
+                queries = [query_prompt_template.format(query) for query in queries]
+
+                # TODO: modify here to use cache to get the beams by `doc_ids` as doc model is freezed,
+                # this will save time and memory
 
                 loss = genx_transformer(queries, docs)
                 accelerator.backward(loss)
@@ -494,7 +495,9 @@ def ddp_process(args):
         # Validate!
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
-                logger.info(f"Validating on datasets at epoch {epoch}...")
+                logger.info(
+                    f"Validating on training and dev datasets after epoch {epoch}..."
+                )
                 log_validation(
                     store,
                     real_train_dataloader,
@@ -513,7 +516,7 @@ def ddp_process(args):
                     global_step=global_step,
                     is_final_validation=False,
                 )
-                logger.info("Validation done!")
+                logger.info(f"Validation after epoch {epoch} done!")
 
     # Evaluate!
     accelerator.wait_for_everyone()

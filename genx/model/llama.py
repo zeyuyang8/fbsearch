@@ -275,7 +275,7 @@ class GenXTransformer:
         # Now this is fine-tuning query model to generate next tokens of document
         assert len(queries) == len(docs)
 
-        beams_for_docs: list[list[str]] = self.sample_beams_of_next_tokens(
+        beams_for_docs: list[list[list[int]]] = self.sample_beams_of_next_tokens(
             self.doc_model,
             self.doc_tokenizer,
             docs,
