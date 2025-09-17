@@ -19,7 +19,7 @@ from accelerate.utils import (
 from genx.const import TRANSFORMERS_PATH_MAP
 from genx.dataset.scifact import get_scifact_query_dataloader, SciFactCorpusDataset
 from genx.model.llama import GenXTransformer, get_genx_transformer
-from genx.model.store import Document, SequencePrefixTreeIndexStore
+from genx.model.store import Document, Prompt, SequencePrefixTreeIndexStore
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -237,8 +237,20 @@ def ddp_process(args):
 
     per_device_train_batch_size = args.per_device_train_batch_size
 
+    # Prompt templates
+    corpus_prompt_template = Prompt(
+        before=args.doc_prompt_before,
+        after=args.doc_prompt_after,
+    ).template
+    query_prompt_template = Prompt(
+        before=args.query_prompt_before,
+        after=args.query_prompt_after,
+    ).template
+
     # Corpus
-    corpus_dataset = SciFactCorpusDataset(corpus_path)
+    corpus_dataset = SciFactCorpusDataset(
+        corpus_path,
+    )
     corpus_dataloader = DataLoader(
         corpus_dataset,
         batch_size=per_device_train_batch_size,
@@ -363,6 +375,8 @@ def ddp_process(args):
             genx_transformer,
             id_len=args.num_next_tokens,
             universe=set(range(genx_transformer.doc_tokenizer.vocab_size)),
+            doc_prompt=corpus_prompt_template,
+            query_prompt=query_prompt_template,
             mode="document_search",
             insertion_depth=args.insertion_depth,
         )
@@ -444,6 +458,9 @@ def ddp_process(args):
             with accelerator.accumulate(models_to_accumulate):
                 queries = batch["query"]
                 docs = batch["text"]
+                docs = [corpus_prompt_template(text) for text in docs]
+                queries = [query_prompt_template(query) for query in queries]
+
                 loss = genx_transformer(queries, docs)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -477,6 +494,7 @@ def ddp_process(args):
         # Validate!
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
+                logger.info(f"Validating on datasets at epoch {epoch}...")
                 log_validation(
                     store,
                     real_train_dataloader,
@@ -495,6 +513,7 @@ def ddp_process(args):
                     global_step=global_step,
                     is_final_validation=False,
                 )
+                logger.info("Validation done!")
 
     # Evaluate!
     accelerator.wait_for_everyone()

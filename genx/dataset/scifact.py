@@ -68,11 +68,10 @@ class SciFactQueryDataset(Dataset):
         doc_id_list = self.queries["cited_doc_ids"][i]
         query = self.queries["claim"][i]
 
-        docs = [
-            self.corpus_dict.get(doc_id)
-            for doc_id in doc_id_list
-            if doc_id in self.corpus_dict
-        ]
+        docs = []
+        for doc_id in doc_id_list:
+            docs.append(self.corpus_dict.get(doc_id))
+
         n_docs = len(docs)
 
         if n_docs == 0:
@@ -108,7 +107,10 @@ def get_scifact_query_dataloader(
     shuffle=False,
     num_workers=0,
 ):
-    scifact_query_dataset = SciFactQueryDataset(queries_path, corpus_dict)
+    scifact_query_dataset = SciFactQueryDataset(
+        queries_path,
+        corpus_dict,
+    )
     dataloader = DataLoader(
         scifact_query_dataset,
         batch_size=batch_size,

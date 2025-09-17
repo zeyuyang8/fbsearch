@@ -79,12 +79,8 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
         transformer,
         id_len,
         universe,
-        doc_prompt_before="Generate identifying phrases that memorize the key concepts in this text. You are not supposed to make sense. Just generate ONLY the identifying phrases without any punctuations or numbers before or after. ",
-        doc_prompt_after=" IGNORE ME. Phrases: ",
-        query_prompt_before="From this query create identifying phrases that capture the key concepts and align with phrases found in relevant text. Do not aim for meaningful sentences. Only output the identifying phrases with no punctuation or numbers before or after. ",
-        query_prompt_after=" IGNORE ME. Phrases: ",
-        duplicate_prompt_before="Given the text first remove all the punctuations and stop words. Then shuffle the sentences. Generate some unique related phrases that does not have synonyms. ",
-        duplicate_prompt_after=" IGNORE ME. Phrases: ",
+        doc_prompt,
+        query_prompt,
         verbose=False,
         initial_capacity=1000,
         insertion_depth=3,
@@ -94,19 +90,9 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
 
         assert mode in ["duplicate_detection", "document_search"]
         self.mode = mode
-        if mode == "duplicate_detection":
-            self.doc_prompt = Prompt(duplicate_prompt_before, duplicate_prompt_after)
-            self.query_prompt = Prompt(duplicate_prompt_before, duplicate_prompt_after)
-        elif mode == "document_search":
-            self.doc_prompt = Prompt(doc_prompt_before, doc_prompt_after)
-            self.query_prompt = Prompt(query_prompt_before, query_prompt_after)
 
-        self.doc_prompt_before = doc_prompt_before
-        self.doc_prompt_after = doc_prompt_after
-        self.query_prompt_before = query_prompt_before
-        self.query_prompt_after = query_prompt_after
-        self.duplicate_prompt_before = duplicate_prompt_before
-        self.duplicate_prompt_after = duplicate_prompt_after
+        self.doc_prompt = doc_prompt
+        self.query_prompt = query_prompt
 
         # Model for generating indices for inserted documens
         self.transformer: GenXTransformer = transformer
@@ -128,23 +114,6 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
     def reset_id_len(self, id_len):
         self.id_len = id_len
         self.transformer.update_num_next_tokens(max_new_tokens=id_len)
-
-    def set_mode(self, mode):
-        assert mode in ["duplicate_detection", "document_search"]
-        self.mode = mode
-        if mode == "duplicate_detection":
-            self.doc_prompt = Prompt(
-                self.duplicate_prompt_before, self.duplicate_prompt_after
-            )
-            self.query_prompt = Prompt(
-                self.duplicate_prompt_before, self.duplicate_prompt_after
-            )
-        elif mode == "document_search":
-            self.doc_prompt = Prompt(self.doc_prompt_before, self.doc_prompt_after)
-            self.query_prompt = Prompt(
-                self.query_prompt_before, self.query_prompt_after
-            )
-        print("Remember to call `clear_store` to reset the database!")
 
     def clear_store(self):
         self.root = PrefixTreeNode()
