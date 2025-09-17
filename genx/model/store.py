@@ -186,7 +186,11 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
         print(f"Inserting '{texts}'") if self.verbose else None
         self._insert_document(texts, self.doc_prompt.format)
 
-    def _query_with_prompt(self, query_texts: list[Document], prompt_template):
+    def _query_with_prompt(
+        self,
+        query_texts: list[Document],
+        prompt_template,
+    ) -> list[list[dict]]:
         if not query_texts:
             return []
 

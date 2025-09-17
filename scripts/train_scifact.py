@@ -3,6 +3,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import itertools
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -109,6 +110,14 @@ def log_validation(
     else:
         f1_score = 0.0
 
+    # Metrics
+    metrics = {
+        "epoch": epoch,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1_score,
+    }
+
     # Log results
     flag = split
     if is_final_validation:
@@ -124,6 +133,7 @@ def log_validation(
                 },
                 step=global_step,
             )
+    return metrics
 
 
 @dataclass
@@ -134,11 +144,6 @@ class Arguments:
     query_model_max_length: int = field(default=128)
     doc_model_max_length: int = field(default=2048)
     torch_dtype: str = field(default="bfloat16")
-
-    # Indexing
-    num_beams: int = field(default=1)
-    num_next_tokens: int = field(default=5)
-    insertion_depth: int = field(default=5)
 
     # Prompts
     doc_prompt_before: str = field(
@@ -164,9 +169,9 @@ class Arguments:
     corpus_filename: str = field(default="corpus.jsonl")
 
     # Logging
-    output_dir: str = field(default="./runs/scifact/train-on-real")
+    output_dir: str = field(default="runs/scifact/train-on-real")
     logging_dir: str = field(default="logs")
-    tracker_name: str = field(default="test")
+    tracker_name: str = field(default="scifact")
 
     # Device
     device: str = field(default="cuda")
@@ -179,12 +184,17 @@ class Arguments:
     report_to: str = field(default="wandb")
     do_report: bool = field(default=True)
 
+    # Indexing
+    num_beams: int = field(default=3)
+    num_next_tokens: int = field(default=5)
+    insertion_depth: int = field(default=4)
+
     # Training
     per_device_train_batch_size: int = field(default=4)
     lr_warmup_steps: int = field(default=100)
     lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
-    num_train_epochs: int = field(default=1000)
+    num_train_epochs: int = field(default=10)
     learning_rate: float = field(default=1e-4)
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
@@ -425,6 +435,10 @@ def ddp_process(args):
     global_step = 0
     first_epoch = 0
 
+    best_dev_f1 = 0.0
+    best_train_metrics = {}
+    best_dev_metrics = {}
+
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -510,7 +524,7 @@ def ddp_process(args):
                 logger.info(
                     f"Validating on training and dev datasets after epoch {epoch}..."
                 )
-                log_validation(
+                train_metrics = log_validation(
                     store,
                     real_train_dataloader,
                     accelerator,
@@ -519,7 +533,7 @@ def ddp_process(args):
                     global_step=global_step,
                     is_final_validation=False,
                 )
-                log_validation(
+                dev_metrics = log_validation(
                     store,
                     dev_dataloader,
                     accelerator,
@@ -528,12 +542,18 @@ def ddp_process(args):
                     global_step=global_step,
                     is_final_validation=False,
                 )
+                dev_f1 = dev_metrics["f1"]
+                if dev_f1 > best_dev_f1:
+                    best_dev_f1 = dev_f1
+                    best_dev_metrics = dev_metrics
+                    best_train_metrics = train_metrics
+
                 logger.info(f"Validation after epoch {epoch} done!")
 
     # Evaluate!
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        log_validation(
+        train_metrics = log_validation(
             store,
             real_train_dataloader,
             accelerator,
@@ -542,7 +562,7 @@ def ddp_process(args):
             global_step=global_step,
             is_final_validation=True,
         )
-        log_validation(
+        dev_metrics = log_validation(
             store,
             dev_dataloader,
             accelerator,
@@ -551,12 +571,23 @@ def ddp_process(args):
             global_step=global_step,
             is_final_validation=True,
         )
+        dev_f1 = dev_metrics["f1"]
+        if dev_f1 > best_dev_f1:
+            best_dev_f1 = dev_f1
+            best_dev_metrics = dev_metrics
+            best_train_metrics = train_metrics
 
     # Finish
     accelerator.end_training()
+    return {
+        "train": best_train_metrics,
+        "dev": best_dev_metrics,
+    }
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser((Arguments))
     (args,) = parser.parse_args_into_dataclasses()
-    ddp_process(args)
+    metrics = ddp_process(args)
+    with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=4)
