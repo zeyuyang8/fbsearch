@@ -58,8 +58,6 @@ def log_validation(
         results.extend(result)
         cited_doc_ids.extend(doc_ids_for_a_query)
 
-    print(results)
-    print(cited_doc_ids)
     assert len(results) == len(cited_doc_ids)
 
     total_predicted = 0
@@ -85,9 +83,6 @@ def log_validation(
 
         cited_doc_id = set(cited_doc_id)
         predicted = set(predicted)
-
-        print(f"True {cited_doc_id}")
-        print(f"Pred {predicted}")
 
         # Count metrics
         total_predicted += len(predicted)
