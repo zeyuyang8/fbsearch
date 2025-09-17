@@ -66,12 +66,12 @@ def run_distributed_training(trial_params: dict, trial_number: int) -> float:
 
 def objective(trial: optuna.Trial) -> float:
     trial_params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-5),
         "per_device_train_batch_size": trial.suggest_categorical(
             "per_device_train_batch_size", [4]
         ),
         "gradient_accumulation_steps": trial.suggest_categorical(
-            "gradient_accumulation_steps", [1, 2, 4]
+            "gradient_accumulation_steps", [1]
         ),
         "num_train_epochs": trial.suggest_int("num_train_epochs", 10, 30),
         "lr_warmup_steps": trial.suggest_int("lr_warmup_steps", 50, 200),
