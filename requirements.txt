@@ -5,6 +5,7 @@ datasets
 sentencepiece
 wandb
 trl
+optuna
 
 # Jupyter
 ipykernel

@@ -31,6 +31,11 @@ logger = get_logger(__name__)
 def log_validation(
     store,
     scifact_dataloader,
+    accelerator,
+    epoch,
+    split: str,
+    global_step: int,
+    is_final_validation: bool = False,
 ):
     cited_doc_ids = []
     results = []
@@ -109,11 +114,21 @@ def log_validation(
     else:
         f1_score = 0.0
 
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1_score,
-    }
+    # Log results
+    flag = split
+    if is_final_validation:
+        flag = f"final-{split}"
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    "epoch": epoch,
+                    f"{flag}-precision": precision,
+                    f"{flag}-recall": recall,
+                    f"{flag}-f1": f1_score,
+                },
+                step=global_step,
+            )
 
 
 @dataclass
@@ -145,7 +160,9 @@ class Arguments:
     duplicate_prompt_after: str = field(default=" IGNORE ME. Phrases: ")
 
     # Data
-    data_path: str = field(default="/home/zy45/code/genx/scripts/data/scifact")
+    data_path: str = field(
+        default="/data/users/zy45/fbsource/fbcode/gen_ai/web_search/genx/scripts/data/scifact/"
+    )
     train_queries_filename: str = field(default="claims_train.jsonl")
     dev_queries_filename: str = field(default="claims_dev.jsonl")
     syn_queries_filename: str = field(default="claims_syn_all_dedup.jsonl")
@@ -180,12 +197,12 @@ class Arguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     dataloader_num_workers: int = field(default=4)
-    validation_epochs: int = field(default=5)
+    validation_epochs: int = field(default=1)
     train_on_syn_data: bool = field(default=False)
 
     # Resume checkpoint
     resume_from_checkpoint: str = field(default=None)
-    checkpointing_epochs: int = field(default=5)
+    checkpointing_epochs: int = field(default=99999)
 
 
 def ddp_process(args):
