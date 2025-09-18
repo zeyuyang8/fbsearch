@@ -46,6 +46,7 @@ class IndexStoreTemplate(ABC):
         self.size = 0
         self._ids = np.zeros(self._initial_capacity, dtype=np.int64)
         self._data_store = {}
+        self._beams_store = {}
 
     def retrieve(self, doc_id):
         return self._data_store[doc_id]

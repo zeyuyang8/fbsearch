@@ -146,10 +146,10 @@ class Arguments:
     torch_dtype: str = field(default="bfloat16")
 
     # Prompts
-    doc_prompt_before: str = field(
-        default="Generate identifying phrases that memorize the key concepts in this text. You are not supposed to make sense. Just generate ONLY the identifying phrases without any punctuations or numbers before or after. "
+    doc_prompt_before: str = field(default="")
+    doc_prompt_after: str = field(
+        default="ifdnclcujnhegfkugtircjfgbkhflrrd eihkjukbregleuuvvgbhicvbkgjnugfv hwlthigatfnnbt7h82fsaebdfu1amvbck\n"
     )
-    doc_prompt_after: str = field(default=" IGNORE ME. Phrases: ")
     query_prompt_before: str = field(
         default="From this query create identifying phrases that capture the key concepts and align with phrases found in relevant text. Do not aim for meaningful sentences. Only output the identifying phrases with no punctuation or numbers before or after. "
     )
@@ -161,7 +161,7 @@ class Arguments:
 
     # Data
     data_path: str = field(
-        default="/data/users/zy45/fbsource/fbcode/gen_ai/web_search/genx/scripts/data/scifact/"
+        default="/data/users/zy45/fbsource/fbcode/gen_ai/web_search/fbsearch/scripts/data/scifact/"
     )
     train_queries_filename: str = field(default="claims_train.jsonl")
     dev_queries_filename: str = field(default="claims_dev.jsonl")
@@ -287,7 +287,6 @@ def ddp_process(args):
         num_workers=args.dataloader_num_workers,
     )
     if args.train_on_syn_data:
-        assert "train-on-syn" in args.output_dir
         train_dataloader = get_scifact_query_dataloader(
             queries_path=[syn_queries_path, train_queries_path],
             corpus_dict=corpus_dict,
@@ -296,7 +295,6 @@ def ddp_process(args):
             num_workers=args.dataloader_num_workers,
         )
     else:
-        assert "train-on-real" in args.output_dir
         train_dataloader = real_train_dataloader
 
     dev_dataloader = get_scifact_query_dataloader(

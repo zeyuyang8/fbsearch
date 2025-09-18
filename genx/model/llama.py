@@ -130,7 +130,7 @@ class GenXTransformer:
         self.config_genx_gen_kwargs(
             num_beams=num_beams,
             num_return_sequences=num_beams,
-            num_next_tokens=num_next_tokens,
+            max_new_tokens=num_next_tokens,
         )
 
         self.save_cache = save_cache
@@ -154,14 +154,14 @@ class GenXTransformer:
         gen_kwargs = {
             "max_new_tokens": kwargs.get("max_new_tokens", 5),
             "do_sample": False,
-            "num_beams": kwargs.get("num_beams", 5),
-            "num_return_sequences": kwargs.get("num_return_sequences", 5),
+            "num_beams": 1,
+            "num_return_sequences": 1,
             "eos_token_id": kwargs.get("eos_token_id", None),
             "pad_token_id": kwargs.get("pad_token_id", None),
         }
         self.genx_gen_kwargs = gen_kwargs
 
-    def index_prompt(self, prompts, model, tokenizer):
+    def index_prompt(self, prompts, model, tokenizer, shift=0):
         device = model.device
 
         if isinstance(prompts, str):
@@ -175,13 +175,15 @@ class GenXTransformer:
         batch["input_len"] = len(batch["input_ids"][0])
 
         genx_gen_kwargs = self.genx_gen_kwargs.copy()
+        genx_gen_kwargs["max_new_tokens"] += shift
+
         with torch.no_grad():
             genx_gen_kwargs["input_ids"] = batch["input_ids"].to(device)
             genx_gen_kwargs["attention_mask"] = batch["attention_mask"].to(device)
             generated_tokens = model.generate(**genx_gen_kwargs)
 
         input_len = batch["input_len"]
-        pred_next_tokens = generated_tokens[:, input_len:]
+        pred_next_tokens = generated_tokens[:, input_len + shift :]
         if self.verbose:
             print(
                 "Decoded tokens:",
@@ -198,52 +200,10 @@ class GenXTransformer:
         return pred_next_tokens
 
     def index_query(self, prompts: list[str]):
-        return self.index_prompt(prompts, self.query_model, self.query_tokenizer)
+        return self.index_prompt(prompts, self.query_model, self.query_tokenizer, 0)
 
     def index_doc(self, prompts: list[str]):
-        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer)
-
-    def sample_beams_of_next_tokens(
-        self,
-        model,
-        tokenizer,
-        prompts: list[str],
-    ) -> list[list[str]]:
-        if isinstance(prompts, str):
-            prompts = [prompts]
-
-        device = model.device
-
-        batch = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding="longest",
-        )
-        batch["input_len"] = len(batch["input_ids"][0])
-
-        gen_kwargs = self.genx_gen_kwargs.copy()
-
-        with torch.no_grad():
-            gen_kwargs["input_ids"] = batch["input_ids"].to(device)
-            gen_kwargs["attention_mask"] = batch["attention_mask"].to(device)
-            generated_tokens = model.generate(**gen_kwargs)
-
-        input_len = batch["input_len"]
-        pred_next_tokens = generated_tokens[:, input_len:]
-        if self.verbose:
-            print(
-                "Decoded tokens:",
-                tokenizer.batch_decode(pred_next_tokens, skip_special_tokens=False),
-            )
-
-        batch_size = len(prompts)
-        num_return_sequences = gen_kwargs["num_return_sequences"]
-
-        pred_next_tokens = pred_next_tokens.view(batch_size, num_return_sequences, -1)
-        pred_next_tokens = pred_next_tokens.cpu().tolist()
-
-        print("Token IDs:", pred_next_tokens) if self.verbose else None
-        return pred_next_tokens
+        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer, 20)
 
     def get_sft_loss_txt(self, model, tokenizer, prompts: list[str]):
         tokens = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
@@ -275,9 +235,7 @@ class GenXTransformer:
         # Now this is fine-tuning query model to generate next tokens of document
         assert len(queries) == len(docs)
 
-        beams_for_docs: list[list[list[int]]] = self.sample_beams_of_next_tokens(
-            self.doc_model,
-            self.doc_tokenizer,
+        beams_for_docs: list[list[list[int]]] = self.index_doc(
             docs,
         )  # Shape is num_docs x num_beams x num_next_tokens
 
