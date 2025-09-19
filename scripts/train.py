@@ -45,6 +45,8 @@ TRANSFORMERS_PATH_MAP = {
     "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
 }
 
+######################################## Datset ########################################
+
 
 def row2text_template_scifact(row):
     text = f"Title: {row['title']}\nAbstract: {' '.join(row['abstract'])}\nStructured: {row['structured']}\n"
@@ -166,6 +168,9 @@ def get_scifact_query_dataloader(
         num_workers=num_workers,
     )
     return dataloader
+
+
+######################################## Model ########################################
 
 
 def get_special_tokens_dict(tokenizer):
@@ -374,6 +379,7 @@ class GenXTransformer:
             length = mask.sum().item()
             cutoff = max(0, length - keep)
             labels[i, :cutoff] = IGNORE_INDEX
+            labels[i, length:] = IGNORE_INDEX
 
         outputs = model(
             input_ids=input_ids,
@@ -410,6 +416,9 @@ class GenXTransformer:
         flats: list[str] = list(itertools.chain.from_iterable(prompts_for_all_pairs))
         loss = self.get_sft_loss_txt(self.query_model, self.query_tokenizer, flats)
         return loss
+
+
+######################################## Store ########################################
 
 
 class Document:
@@ -472,7 +481,13 @@ class IndexStoreTemplate(ABC):
         pass
 
     @staticmethod
-    def plot_list_frequencies(data, figsize=(12, 8), show_top_n=10, save_path=None):
+    def plot_list_frequencies(
+        data,
+        figsize=(12, 8),
+        show_top_n=10,
+        save_path=None,
+        verbose=False,
+    ):
         # Extract all lists and convert to tuples for counting
         all_lists = []
         for list_of_lists in data.values():
@@ -532,46 +547,49 @@ class IndexStoreTemplate(ABC):
         else:
             plt.show()
 
-        # Calculate statistics
-        stats = {
-            "total_lists": len(all_lists),
-            "unique_lists": len(list_freq),
-            "lists_appearing_once": freq_of_freq.get(1, 0),
-            "lists_appearing_multiple": sum(
-                count for freq, count in freq_of_freq.items() if freq > 1
-            ),
-            "max_frequency": max(all_frequency_values),
-            "frequency_distribution": dict(freq_of_freq),
-        }
+        if verbose:
+            # Calculate statistics
+            stats = {
+                "total_lists": len(all_lists),
+                "unique_lists": len(list_freq),
+                "lists_appearing_once": freq_of_freq.get(1, 0),
+                "lists_appearing_multiple": sum(
+                    count for freq, count in freq_of_freq.items() if freq > 1
+                ),
+                "max_frequency": max(all_frequency_values),
+                "frequency_distribution": dict(freq_of_freq),
+            }
 
-        # Print statistics
-        print("Summary Statistics:")
-        print(f"Total number of lists: {stats['total_lists']}")
-        print(f"Number of unique lists: {stats['unique_lists']}")
-        print(f"Lists appearing once: {stats['lists_appearing_once']}")
-        print(f"Lists appearing more than once: {stats['lists_appearing_multiple']}")
-        print(f"Maximum frequency: {stats['max_frequency']}")
+            # Print statistics
+            print("Summary Statistics:")
+            print(f"Total number of lists: {stats['total_lists']}")
+            print(f"Number of unique lists: {stats['unique_lists']}")
+            print(f"Lists appearing once: {stats['lists_appearing_once']}")
+            print(
+                f"Lists appearing more than once: {stats['lists_appearing_multiple']}"
+            )
+            print(f"Maximum frequency: {stats['max_frequency']}")
 
-        # Show top frequent lists
-        if len(list_freq) <= show_top_n * 2:
-            print("\nAll unique lists and their frequencies:")
-            for i, (unique_list, count) in enumerate(
-                sorted(list_freq.items(), key=lambda x: x[1], reverse=True), 1
-            ):
-                print(f"{i:2d}: {list(unique_list)} appears {count} time(s)")
-        else:
-            print(f"\nTop {show_top_n} most frequent lists:")
-            for i, (unique_list, count) in enumerate(
-                sorted(list_freq.items(), key=lambda x: x[1], reverse=True)[
-                    :show_top_n
-                ],
-                1,
-            ):
-                print(f"{i:2d}: {list(unique_list)} appears {count} time(s)")
+            # Show top frequent lists
+            if len(list_freq) <= show_top_n * 2:
+                print("\nAll unique lists and their frequencies:")
+                for i, (unique_list, count) in enumerate(
+                    sorted(list_freq.items(), key=lambda x: x[1], reverse=True), 1
+                ):
+                    print(f"{i:2d}: {list(unique_list)} appears {count} time(s)")
+            else:
+                print(f"\nTop {show_top_n} most frequent lists:")
+                for i, (unique_list, count) in enumerate(
+                    sorted(list_freq.items(), key=lambda x: x[1], reverse=True)[
+                        :show_top_n
+                    ],
+                    1,
+                ):
+                    print(f"{i:2d}: {list(unique_list)} appears {count} time(s)")
 
-        print("\nFrequency distribution:")
-        for freq in sorted(freq_of_freq.keys()):
-            print(f"{freq_of_freq[freq]} lists appear exactly {freq} time(s)")
+            print("\nFrequency distribution:")
+            for freq in sorted(freq_of_freq.keys()):
+                print(f"{freq_of_freq[freq]} lists appear exactly {freq} time(s)")
 
         return stats
 
@@ -842,6 +860,9 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
         return self._query_with_prompt(query_texts, self.query_prompt.format)
 
 
+######################################## Train ########################################
+
+
 def log_validation(
     store,
     scifact_dataloader,
@@ -1108,7 +1129,7 @@ def ddp_process(args):
         queries_path=train_queries_path,
         corpus_dict=corpus_dict,
         batch_size=per_device_train_batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=args.dataloader_num_workers,
     )
     if args.train_on_syn_data:
@@ -1116,7 +1137,7 @@ def ddp_process(args):
             queries_path=[syn_queries_path, train_queries_path],
             corpus_dict=corpus_dict,
             batch_size=per_device_train_batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=args.dataloader_num_workers,
         )
     else:
