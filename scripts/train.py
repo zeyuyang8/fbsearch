@@ -33,9 +33,12 @@ from transformers import (
     AutoTokenizer,
     get_scheduler,
     HfArgumentParser,
+    PreTrainedTokenizer,
 )
 
 plt.rcParams["font.family"] = "DejaVu Sans"
+
+IGNORE_INDEX = -100
 
 TRANSFORMERS_PATH_MAP = {
     "llama-3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct",
@@ -44,7 +47,10 @@ TRANSFORMERS_PATH_MAP = {
 
 
 def row2text_template_scifact(row):
-    return f"Title: {row['title']}\nAbstract: {' '.join(row['abstract'])}\nStructured: {row['structured']}\n"
+    text = f"Title: {row['title']}\nAbstract: {' '.join(row['abstract'])}\nStructured: {row['structured']}\n"
+    # Remove all newlines and strip extra spaces
+    text = text.replace("\n", " ")
+    return text
 
 
 class SciFactCorpusDataset(Dataset):
@@ -198,6 +204,30 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
+def _tokenize_fn(strings: list[str], tokenizer: PreTrainedTokenizer):
+    tokenized_list = [
+        tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        )
+        for text in strings
+    ]
+    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()
+        for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
 def get_model_and_tokenizer(
     model_name_or_path,
     model_max_length=1024,
@@ -206,7 +236,7 @@ def get_model_and_tokenizer(
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
         model_max_length=model_max_length,
-        padding_side="left",
+        padding_side="right",
         use_fast=False,
     )
     special_tokens_dict = get_special_tokens_dict(tokenizer)
@@ -221,35 +251,6 @@ def get_model_and_tokenizer(
         model=model,
     )
     return model, tokenizer
-
-
-def get_genx_transformer(
-    query_model_name_or_path,
-    doc_model_name_or_path,
-    query_model_max_length=128,
-    doc_model_max_length=512,
-    num_beams: int = 5,
-    num_next_tokens: int = 5,
-    torch_dtype=torch.bfloat16,
-):
-    query_model, query_tokenizer = get_model_and_tokenizer(
-        query_model_name_or_path,
-        model_max_length=query_model_max_length,
-        torch_dtype=torch_dtype,
-    )
-    doc_model, doc_tokenizer = get_model_and_tokenizer(
-        doc_model_name_or_path,
-        model_max_length=doc_model_max_length,
-        torch_dtype=torch_dtype,
-    )
-    return GenXTransformer(
-        query_model=query_model,
-        doc_model=doc_model,
-        query_tokenizer=query_tokenizer,
-        doc_tokenizer=doc_tokenizer,
-        num_beams=num_beams,
-        num_next_tokens=num_next_tokens,
-    )
 
 
 class GenXTransformer:
@@ -301,7 +302,6 @@ class GenXTransformer:
             "num_beams": kwargs.get("num_beams", 1),
             "num_return_sequences": kwargs.get("num_return_sequences", 1),
             "eos_token_id": kwargs.get("eos_token_id", None),
-            "pad_token_id": kwargs.get("pad_token_id", None),
         }
         self.genx_gen_kwargs = gen_kwargs
 
@@ -316,17 +316,24 @@ class GenXTransformer:
             return_tensors="pt",
             padding="longest",
         )
-        batch["input_len"] = len(batch["input_ids"][0])
 
         genx_gen_kwargs = self.genx_gen_kwargs.copy()
         genx_gen_kwargs["max_new_tokens"] += shift
 
+        bad_chars = ["#", "\n", ".", "}", "{", "step"] + list("0123456789")
+        bad_words_ids = [
+            tokenizer.encode(char, add_special_tokens=False) for char in bad_chars
+        ]
+
         with torch.no_grad():
             genx_gen_kwargs["input_ids"] = batch["input_ids"].to(device)
             genx_gen_kwargs["attention_mask"] = batch["attention_mask"].to(device)
-            generated_tokens = model.generate(**genx_gen_kwargs)
+            generated_tokens = model.generate(
+                **genx_gen_kwargs,
+                bad_words_ids=bad_words_ids,
+            )
 
-        input_len = batch["input_len"]
+        input_len = len(batch["input_ids"][0])
         pred_next_tokens = generated_tokens[:, input_len + shift :]
         if self.verbose:
             print(
@@ -347,33 +354,33 @@ class GenXTransformer:
         return self.index_prompt(prompts, self.query_model, self.query_tokenizer, 0)
 
     def index_doc(self, prompts: list[str]):
-        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer, 10)
+        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer, 3)
 
     def get_sft_loss_txt(self, model, tokenizer, prompts: list[str]):
-        tokens = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        tokens = {k: v.to(model.device) for k, v in tokens.items()}
+        tokens = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+        ).to(model.device)
 
         input_ids = tokens["input_ids"]
         attention_mask = tokens["attention_mask"]
+
         labels = input_ids.clone()
-
-        # Mask out all but last 5 tokens
-        # shape: (batch_size, seq_len)
-        batch_size, seq_len = input_ids.size()
         keep = self.num_next_tokens
-        mask = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(
-            batch_size, -1
-        ) < (seq_len - keep)
-
-        labels[mask] = -100  # -100 tells HF loss function to ignore those positions
+        for i, mask in enumerate(attention_mask):
+            length = mask.sum().item()
+            cutoff = max(0, length - keep)
+            labels[i, :cutoff] = IGNORE_INDEX
 
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
         )
-        loss = outputs.loss
-        return loss
+        return outputs.loss
 
     def __call__(self, queries: list[str], docs: list[str]):
         # Now this is fine-tuning query model to generate next tokens of document
@@ -954,11 +961,11 @@ class Arguments:
     # Prompts
     doc_prompt_before: str = field(default="")
     doc_prompt_after: str = field(
-        default="ifdnclcujnhegfkugtircjfgbkhflrrd eihkjukbregleuuvvgbhicvbkgjnugfv hwlthigatfnnbt7h82fsaebdfu1amvbck: "
+        default="Give me keywords. Do NOT use bullet points, numbered lists, or line breaks. Keep the output as one continuous block of text."
     )
     query_prompt_before: str = field(default="")
     query_prompt_after: str = field(
-        default="ifdnclcujnhegfkugtircjfgbkhflrrd eihkjukbregleuuvvgbhicvbkgjnugfv hwlthigatfnnbt7h82fsaebdfu1amvbck: "
+        default="Give me potential keywords of related articles."
     )
     duplicate_prompt_before: str = field(
         default="Given the text first remove all the punctuations and stop words. Then shuffle the sentences. Generate some unique related phrases that does not have synonyms. "
@@ -1002,11 +1009,11 @@ class Arguments:
     insertion_depth: int = field(default=5)
 
     # Training
-    per_device_train_batch_size: int = field(default=4)
+    per_device_train_batch_size: int = field(default=16)
     lr_warmup_steps: int = field(default=100)
     lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
-    num_train_epochs: int = field(default=50)
+    num_train_epochs: int = field(default=500)
     learning_rate: float = field(default=5e-5)
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
@@ -1014,7 +1021,7 @@ class Arguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     dataloader_num_workers: int = field(default=4)
-    validation_epochs: int = field(default=1)
+    validation_epochs: int = field(default=20)
     train_on_syn_data: bool = field(default=False)
 
     # Resume checkpoint
@@ -1127,26 +1134,26 @@ def ddp_process(args):
     torch_dtype = getattr(torch, args.torch_dtype)
 
     # Model
-    # if "query_model" not in locals():
-    print("Loading models...")
-    query_model_name_or_path = TRANSFORMERS_PATH_MAP[args.query_model_alias]
-    doc_model_name_or_path = TRANSFORMERS_PATH_MAP[args.doc_model_alias]
-    # if "query_model_copy" not in locals():
-    query_model_copy, query_tokenizer = get_model_and_tokenizer(
-        query_model_name_or_path,
-        model_max_length=args.query_model_max_length,
-        torch_dtype=torch_dtype,
-    )
-    # if "doc_model" not in locals():
-    doc_model, doc_tokenizer = get_model_and_tokenizer(
-        doc_model_name_or_path,
-        model_max_length=args.doc_model_max_length,
-        torch_dtype=torch_dtype,
-    )
-    doc_model.to(accelerator.device, dtype=torch_dtype)
+    if "query_model" not in locals():
+        print("Loading models...")
+        query_model_name_or_path = TRANSFORMERS_PATH_MAP[args.query_model_alias]
+        doc_model_name_or_path = TRANSFORMERS_PATH_MAP[args.doc_model_alias]
+        if "query_model_copy" not in locals():
+            query_model_copy, query_tokenizer = get_model_and_tokenizer(
+                query_model_name_or_path,
+                model_max_length=args.query_model_max_length,
+                torch_dtype=torch_dtype,
+            )
+        if "doc_model" not in locals():
+            doc_model, doc_tokenizer = get_model_and_tokenizer(
+                doc_model_name_or_path,
+                model_max_length=args.doc_model_max_length,
+                torch_dtype=torch_dtype,
+            )
+            doc_model.to(accelerator.device, dtype=torch_dtype)
 
-    query_model = copy.deepcopy(query_model_copy)
-    query_model.to(accelerator.device, dtype=torch_dtype)
+        query_model = copy.deepcopy(query_model_copy)
+        query_model.to(accelerator.device, dtype=torch_dtype)
 
     # Only train the query model
     query_model.train()
