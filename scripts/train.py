@@ -1184,6 +1184,29 @@ def ddp_process(args):
         num_training_steps=num_training_steps_for_scheduler,
     )
 
+    # The size of the training dataloader may have changed due to accelerator.prepare, so we need to recalculate our total training steps
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
+    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    if num_training_steps_for_scheduler != max_train_steps:
+        logger.warning(
+            f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
+            f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
+            f"This inconsistency may result in the learning rate scheduler not functioning properly."
+        )
+    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+
+    genx_transformer = GenXTransformer(
+        query_model=query_model,
+        doc_model=doc_model,
+        query_tokenizer=query_tokenizer,
+        doc_tokenizer=doc_tokenizer,
+        num_beams=args.num_beams,
+        num_next_tokens=args.num_next_tokens,
+    )
+    print(genx_transformer.genx_gen_kwargs)
+
     # Prepare everything with our accelerator
     (
         query_model,
@@ -1203,33 +1226,10 @@ def ddp_process(args):
         lr_scheduler,
     )
 
-    # The size of the training dataloader may have changed due to accelerator.prepare, so we need to recalculate our total training steps
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
-    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    if num_training_steps_for_scheduler != max_train_steps:
-        logger.warning(
-            f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
-            f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
-            f"This inconsistency may result in the learning rate scheduler not functioning properly."
-        )
-    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
-
     # Report
     if accelerator.is_main_process and args.do_report:
         tracker_name = args.tracker_name
         accelerator.init_trackers(tracker_name, config=vars(args))
-
-    genx_transformer = GenXTransformer(
-        query_model=query_model,
-        doc_model=doc_model,
-        query_tokenizer=query_tokenizer,
-        doc_tokenizer=doc_tokenizer,
-        num_beams=args.num_beams,
-        num_next_tokens=args.num_next_tokens,
-    )
-    print(genx_transformer.genx_gen_kwargs)
 
     store = SequencePrefixTreeIndexStore(
         genx_transformer,
@@ -1392,9 +1392,6 @@ def ddp_process(args):
         # Validate!
         if accelerator.is_main_process:
             if epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Validating on training and dev datasets after epoch {epoch}..."
-                )
                 train_metrics = log_validation(
                     store,
                     real_train_dataloader,
@@ -1418,8 +1415,6 @@ def ddp_process(args):
                     best_dev_f1 = dev_f1
                     best_dev_metrics = dev_metrics
                     best_train_metrics = train_metrics
-
-                logger.info(f"Validation after epoch {epoch} done!")
 
     # Evaluate!
     accelerator.wait_for_everyone()

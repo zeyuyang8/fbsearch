@@ -2,7 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=1,2
 
-torchrun --nproc_per_node=2 --master-port 2025 scifact.py \
+torchrun --nproc_per_node=2 --master-port 2025 train.py \
     --do_report true \
     --corpus_filename corpus.jsonl \
     --train_queries_filename claims_train.jsonl \
@@ -14,5 +14,5 @@ torchrun --nproc_per_node=2 --master-port 2025 scifact.py \
     --learning_rate 5e-5 \
     --num_train_epochs 20 \
     --num_beams 1 \
-    --num_next_tokens 5 \
-    --insertion_depth 5
+    --num_next_tokens 3 \
+    --insertion_depth 3
