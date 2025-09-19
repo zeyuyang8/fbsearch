@@ -11,7 +11,9 @@ with-proxy conda install pip
 with-proxy pip install -r requirements.txt
 with-proxy pip install -e . && rm -rf ./genx.egg-info
 ```
-or alternatively you can use
+
+Or alternatively you can use:
+
 ```bash
 conda activate /home/zy45/.conda/envs/fbs
 ```
@@ -29,6 +31,15 @@ export PATH=$CUDA_HOME/bin:$PATH
 
 export WANDB_API_KEY="0d6a256ecfbb546c6e7712cbe9639487c1ef77bc"
 export HF_HUB_DISABLE_XET=1
-export http_proxy="http://fwdproxy:8080"
-export https_proxy="http://fwdproxy:8080"
+export HF_TOKEN="..."
+export http_proxy=http://fwdproxy:8080
+export https_proxy=http://fwdproxy:8080
+export no_proxy=".fbcdn.net,.facebook.com,.thefacebook.com,.tfbnw.net,.fb.com,.fb"
+```
+
+
+Convert your notebook to script:
+
+```bash
+jupyter nbconvert --to python debug.ipynb --PythonExporter.exclude_markdown=True --TagRemovePreprocessor.remove_cell_tags="['notebook_only']" --log-level ERROR
 ```

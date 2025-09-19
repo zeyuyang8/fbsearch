@@ -11,6 +11,7 @@ optuna
 ipykernel
 ipywidgets
 pyrefly
+nbconvert
 
 # Compute
 numpy
