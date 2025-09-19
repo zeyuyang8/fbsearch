@@ -29,7 +29,6 @@ export PATH=$CUDA_HOME/bin:$PATH
 
 export WANDB_API_KEY="0d6a256ecfbb546c6e7712cbe9639487c1ef77bc"
 export HF_HUB_DISABLE_XET=1
-export HF_TOKEN="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"
 export http_proxy="http://fwdproxy:8080"
 export https_proxy="http://fwdproxy:8080"
 ```
