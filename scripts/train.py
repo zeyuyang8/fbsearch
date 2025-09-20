@@ -45,6 +45,7 @@ TRANSFORMERS_PATH_MAP = {
     "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
 }
 
+
 ######################################## Datset ########################################
 
 
@@ -237,11 +238,12 @@ def get_model_and_tokenizer(
     model_name_or_path,
     model_max_length=1024,
     torch_dtype=torch.bfloat16,
+    padding_side="right",
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
         model_max_length=model_max_length,
-        padding_side="right",
+        padding_side=padding_side,
         use_fast=False,
     )
     special_tokens_dict = get_special_tokens_dict(tokenizer)
@@ -263,8 +265,8 @@ class GenXTransformer:
         self,
         query_model,
         doc_model,
-        query_tokenizer,
-        doc_tokenizer,
+        train_tokenizer,
+        inference_tokenizer,
         num_beams: int = 5,
         num_next_tokens: int = 5,
     ):
@@ -272,8 +274,8 @@ class GenXTransformer:
         self.query_model = query_model
         self.doc_model = doc_model
 
-        self.query_tokenizer = query_tokenizer
-        self.doc_tokenizer = doc_tokenizer
+        self.train_tokenizer = train_tokenizer
+        self.inference_tokenizer = inference_tokenizer
 
         self.num_beams = num_beams
         self.num_next_tokens = num_next_tokens
@@ -356,10 +358,10 @@ class GenXTransformer:
         return pred_next_tokens
 
     def index_query(self, prompts: list[str]):
-        return self.index_prompt(prompts, self.query_model, self.query_tokenizer, 0)
+        return self.index_prompt(prompts, self.query_model, self.inference_tokenizer, 0)
 
     def index_doc(self, prompts: list[str]):
-        return self.index_prompt(prompts, self.doc_model, self.doc_tokenizer, 3)
+        return self.index_prompt(prompts, self.doc_model, self.inference_tokenizer, 3)
 
     def get_sft_loss_txt(self, model, tokenizer, prompts: list[str]):
         tokens = tokenizer(
@@ -402,7 +404,9 @@ class GenXTransformer:
         # Shape is num_docs x num_beams x (len(query) + num_next_tokens)
         prompts_for_all_pairs: list[list[str]] = []
         for doc_idx, beams in enumerate(beams_for_docs):
-            beams = self.doc_tokenizer.batch_decode(beams, skip_special_tokens=False)
+            beams = self.inference_tokenizer.batch_decode(
+                beams, skip_special_tokens=False
+            )
             prompts = []  # List of the same query and num_beams possible next sentences
 
             query = queries[doc_idx]
@@ -414,7 +418,7 @@ class GenXTransformer:
 
         # Have num_docs x num_beams sequences, each of a string of length (len(query) + num_next_tokens)
         flats: list[str] = list(itertools.chain.from_iterable(prompts_for_all_pairs))
-        loss = self.get_sft_loss_txt(self.query_model, self.query_tokenizer, flats)
+        loss = self.get_sft_loss_txt(self.query_model, self.train_tokenizer, flats)
         return loss
 
 
@@ -591,7 +595,7 @@ class IndexStoreTemplate(ABC):
             for freq in sorted(freq_of_freq.keys()):
                 print(f"{freq_of_freq[freq]} lists appear exactly {freq} time(s)")
 
-        return stats
+            return stats
 
 
 class PrefixTreeNode:
@@ -712,7 +716,7 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
             print(
                 id,
                 val,
-                self.transformer.doc_tokenizer.batch_decode(
+                self.transformer.inference_tokenizer.batch_decode(
                     val, skip_special_tokens=False
                 ),
             )
@@ -828,8 +832,10 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
                 result = self._traverse_tree_for_query(seq)
                 if result:
                     result["index_ids"] = seq
-                    result["index_txt"] = self.transformer.doc_tokenizer.batch_decode(
-                        seq, skip_special_tokens=False
+                    result["index_txt"] = (
+                        self.transformer.inference_tokenizer.batch_decode(
+                            seq, skip_special_tokens=False
+                        )
                     )
                     result_ids.append(result)
             print("Found results: ", result_ids) if self.verbose else None
@@ -975,8 +981,8 @@ class Arguments:
     # Model
     query_model_alias: str = field(default="llama-3.2-1b-instruct")
     doc_model_alias: str = field(default="llama-3.2-1b-instruct")
-    query_model_max_length: int = field(default=128)
-    doc_model_max_length: int = field(default=2048)
+    train_max_length: int = field(default=128)
+    inference_max_length: int = field(default=2048)
     torch_dtype: str = field(default="bfloat16")
 
     # Prompts
@@ -1003,7 +1009,7 @@ class Arguments:
     corpus_filename: str = field(default="corpus.jsonl")
     store_state_filename: str = field(default="store.joblib")
     output_dir: str = field(
-        default="/data/users/zy45/fbsource/fbcode/gen_ai/web_search/fbsearch/scripts/runs/scifact/train-on-real"
+        default="/data/users/zy45/fbsource/fbcode/gen_ai/web_search/fbsearch/scripts/runs/scifact/train-real-beam1-token3"
     )
 
     # Loading
@@ -1022,19 +1028,19 @@ class Arguments:
     # Accelerator
     mixed_precision: str = field(default="bf16")
     report_to: str = field(default="wandb")
-    do_report: bool = field(default=True)
+    do_report: bool = field(default=False)
 
     # Indexing
     num_beams: int = field(default=1)
-    num_next_tokens: int = field(default=5)
-    insertion_depth: int = field(default=5)
+    num_next_tokens: int = field(default=3)
+    insertion_depth: int = field(default=3)
 
     # Training
     per_device_train_batch_size: int = field(default=16)
     lr_warmup_steps: int = field(default=100)
     lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
-    num_train_epochs: int = field(default=500)
+    num_train_epochs: int = field(default=20)
     learning_rate: float = field(default=5e-5)
     adam_beta1: float = field(default=0.9)
     adam_beta2: float = field(default=0.999)
@@ -1042,7 +1048,7 @@ class Arguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     dataloader_num_workers: int = field(default=4)
-    validation_epochs: int = field(default=20)
+    validation_epochs: int = field(default=1)
     train_on_syn_data: bool = field(default=False)
 
     # Resume checkpoint
@@ -1051,6 +1057,9 @@ class Arguments:
 
 
 logger = get_logger(__name__)
+
+
+######################################## Run ########################################
 
 
 def ddp_process(args):
@@ -1155,26 +1164,28 @@ def ddp_process(args):
     torch_dtype = getattr(torch, args.torch_dtype)
 
     # Model
-    if "query_model" not in locals():
-        print("Loading models...")
-        query_model_name_or_path = TRANSFORMERS_PATH_MAP[args.query_model_alias]
-        doc_model_name_or_path = TRANSFORMERS_PATH_MAP[args.doc_model_alias]
-        if "query_model_copy" not in locals():
-            query_model_copy, query_tokenizer = get_model_and_tokenizer(
-                query_model_name_or_path,
-                model_max_length=args.query_model_max_length,
-                torch_dtype=torch_dtype,
-            )
-        if "doc_model" not in locals():
-            doc_model, doc_tokenizer = get_model_and_tokenizer(
-                doc_model_name_or_path,
-                model_max_length=args.doc_model_max_length,
-                torch_dtype=torch_dtype,
-            )
-            doc_model.to(accelerator.device, dtype=torch_dtype)
+    # if "query_model" not in locals():
+    print("Loading models...")
+    query_model_name_or_path = TRANSFORMERS_PATH_MAP[args.query_model_alias]
+    doc_model_name_or_path = TRANSFORMERS_PATH_MAP[args.doc_model_alias]
+    # if "query_model_copy" not in locals():
+    query_model_copy, train_tokenizer = get_model_and_tokenizer(
+        query_model_name_or_path,
+        model_max_length=args.train_max_length,
+        torch_dtype=torch_dtype,
+        padding_side="right",
+    )
+    # if "doc_model" not in locals():
+    doc_model, inference_tokenizer = get_model_and_tokenizer(
+        doc_model_name_or_path,
+        model_max_length=args.inference_max_length,
+        torch_dtype=torch_dtype,
+        padding_side="left",
+    )
+    doc_model.to(accelerator.device, dtype=torch_dtype)
 
-        query_model = copy.deepcopy(query_model_copy)
-        query_model.to(accelerator.device, dtype=torch_dtype)
+    query_model = copy.deepcopy(query_model_copy)
+    query_model.to(accelerator.device, dtype=torch_dtype)
 
     # Only train the query model
     query_model.train()
@@ -1228,8 +1239,8 @@ def ddp_process(args):
     genx_transformer = GenXTransformer(
         query_model=query_model,
         doc_model=doc_model,
-        query_tokenizer=query_tokenizer,
-        doc_tokenizer=doc_tokenizer,
+        train_tokenizer=train_tokenizer,
+        inference_tokenizer=inference_tokenizer,
         num_beams=args.num_beams,
         num_next_tokens=args.num_next_tokens,
     )
@@ -1262,7 +1273,7 @@ def ddp_process(args):
     store = SequencePrefixTreeIndexStore(
         genx_transformer,
         id_len=args.num_next_tokens,
-        universe=set(range(genx_transformer.doc_tokenizer.vocab_size)),
+        universe=set(range(genx_transformer.inference_tokenizer.vocab_size)),
         doc_prompt=corpus_prompt_template,
         query_prompt=query_prompt_template,
         mode="document_search",
@@ -1275,12 +1286,14 @@ def ddp_process(args):
     if args.load_store_state and os.path.exists(store_state_path):
         logger.info("Loading state...")
         store.load_state(store_state_path)
-        store.print_beams_store()
-        print()
+        if len(store._beams_store) < 10:
+            store.print_beams_store()
+            print()
         store.plot_list_frequencies(
             store._beams_store,
-            figsize=(8, 6),
+            figsize=(12, 8),
             save_path=os.path.join(args.output_dir, "freq.pdf"),
+            verbose=True if accelerator.is_main_process else False,
         )
     else:
         logger.info("Inserting corpus into data store...")
@@ -1292,13 +1305,15 @@ def ddp_process(args):
                 doc_id = doc_id.cpu().item()
                 to_be_inserted.append(Document(text, {"doc_id": doc_id}))
             store.insert(to_be_inserted)
+        if len(store._beams_store) < 10:
+            store.print_beams_store()
+            print()
         store.save_state(store_state_path)
-        store.print_beams_store()
-        print()
         store.plot_list_frequencies(
             store._beams_store,
-            figsize=(8, 6),
+            figsize=(12, 8),
             save_path=os.path.join(args.output_dir, "freq.pdf"),
+            verbose=True if accelerator.is_main_process else False,
         )
 
     # Log some info about our training
