@@ -869,6 +869,7 @@ class SequencePrefixTreeIndexStore(IndexStoreTemplate):
 ######################################## Train ########################################
 
 
+@torch.no_grad()
 def log_validation(
     store,
     scifact_dataloader,
@@ -1073,12 +1074,19 @@ def ddp_process(args):
         project_dir=args.output_dir, logging_dir=logging_dir
     )
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+    # Set CUDA device explicitly for distributed training
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[kwargs],
+        device_placement=True,  # Ensure proper device placement
     )
 
     # Make one log on every process with the configuration for debugging
@@ -1223,19 +1231,6 @@ def ddp_process(args):
         num_training_steps=num_training_steps_for_scheduler,
     )
 
-    # The size of the training dataloader may have changed due to accelerator.prepare, so we need to recalculate our total training steps
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
-    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    if num_training_steps_for_scheduler != max_train_steps:
-        logger.warning(
-            f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
-            f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
-            f"This inconsistency may result in the learning rate scheduler not functioning properly."
-        )
-    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
-
     genx_transformer = GenXTransformer(
         query_model=query_model,
         doc_model=doc_model,
@@ -1253,7 +1248,6 @@ def ddp_process(args):
         optimizer,
         corpus_dataloader,
         train_dataloader,
-        dev_dataloader,
         lr_scheduler,
     ) = accelerator.prepare(
         query_model,
@@ -1261,9 +1255,21 @@ def ddp_process(args):
         optimizer,
         corpus_dataloader,
         train_dataloader,
-        dev_dataloader,
         lr_scheduler,
     )
+
+    # The size of the training dataloader may have changed due to accelerator.prepare, so we need to recalculate our total training steps
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
+    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    if num_training_steps_for_scheduler != max_train_steps:
+        logger.warning(
+            f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
+            f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
+            f"This inconsistency may result in the learning rate scheduler not functioning properly."
+        )
+    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
     # Report
     if accelerator.is_main_process and args.do_report:
@@ -1281,8 +1287,10 @@ def ddp_process(args):
     )
     store.clear_store()
     store.set_verbose_for_all(False)
-
-    store_state_path = os.path.join(args.output_dir, args.store_state_filename)
+    global_rank = accelerator.state.process_index
+    store_state_path = os.path.join(
+        args.output_dir, f"rank{global_rank}-{args.store_state_filename}"
+    )
     if args.load_store_state and os.path.exists(store_state_path):
         logger.info("Loading state...")
         store.load_state(store_state_path)
@@ -1292,7 +1300,7 @@ def ddp_process(args):
         store.plot_list_frequencies(
             store._beams_store,
             figsize=(12, 8),
-            save_path=os.path.join(args.output_dir, "freq.pdf"),
+            save_path=os.path.join(args.output_dir, f"rank{global_rank}-freq.pdf"),
             verbose=True if accelerator.is_main_process else False,
         )
     else:
@@ -1312,7 +1320,7 @@ def ddp_process(args):
         store.plot_list_frequencies(
             store._beams_store,
             figsize=(12, 8),
-            save_path=os.path.join(args.output_dir, "freq.pdf"),
+            save_path=os.path.join(args.output_dir, f"rank{global_rank}-freq.pdf"),
             verbose=True if accelerator.is_main_process else False,
         )
 
