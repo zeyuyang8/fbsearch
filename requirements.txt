@@ -6,6 +6,7 @@ sentencepiece
 wandb
 trl
 optuna
+torchtyping
 
 # Jupyter
 ipykernel
@@ -31,3 +32,6 @@ mteb
 
 # Data
 recordlinkage
+
+# General
+deprecated

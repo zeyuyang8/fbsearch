@@ -3,7 +3,6 @@ __pycache__
 
 wandb
 runs
-data
-notebooks
+.notes
 
-mast.py
+*.ipynb

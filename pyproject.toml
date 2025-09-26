@@ -11,7 +11,7 @@ project-excludes = [
 ]
 disable_type_errors_in_ide = true
 site-package-path = [
-    "/home/zy45/.conda/envs/fbs/lib/python3.12/site-packages",
+    "/home/zy45/.conda/envs/fbsearch/lib/python3.12/site-packages",
     "/home/zy45/.local/lib/python3.12/site-packages"
 ]
 

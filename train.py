@@ -286,6 +286,7 @@ class GenXTransformer:
             num_beams=num_beams,
             num_return_sequences=num_beams,
             max_new_tokens=num_next_tokens,
+            min_new_tokens=num_next_tokens,
         )
 
     def set_train_eval_mode(self, query_train: bool = True, doc_train: bool = False):
@@ -304,6 +305,7 @@ class GenXTransformer:
 
     def config_genx_gen_kwargs(self, **kwargs):
         gen_kwargs = {
+            "min_new_tokens": kwargs.get("min_new_tokens", 5),
             "max_new_tokens": kwargs.get("max_new_tokens", 5),
             "do_sample": False,
             "num_beams": kwargs.get("num_beams", 1),
@@ -326,6 +328,7 @@ class GenXTransformer:
 
         genx_gen_kwargs = self.genx_gen_kwargs.copy()
         genx_gen_kwargs["max_new_tokens"] += shift
+        genx_gen_kwargs["min_new_tokens"] += shift
 
         bad_chars = ["#", "\n", ".", "}", "{", "step"] + list("0123456789")
         bad_words_ids = [
@@ -1075,11 +1078,6 @@ def ddp_process(args):
     )
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-    # Set CUDA device explicitly for distributed training
-    if torch.cuda.is_available():
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -1241,19 +1239,70 @@ def ddp_process(args):
     )
     print(genx_transformer.genx_gen_kwargs)
 
+    store = SequencePrefixTreeIndexStore(
+        genx_transformer,
+        id_len=args.num_next_tokens,
+        universe=set(range(genx_transformer.inference_tokenizer.vocab_size)),
+        doc_prompt=corpus_prompt_template,
+        query_prompt=query_prompt_template,
+        mode="document_search",
+        insertion_depth=args.insertion_depth,
+    )
+    store.clear_store()
+    store.set_verbose_for_all(False)
+    store_state_path = os.path.join(args.output_dir, f"{args.store_state_filename}")
+
+    # Main process loads/populates, others wait
+    if accelerator.is_main_process:
+        if args.load_store_state and os.path.exists(store_state_path):
+            logger.info("Loading state...")
+            store.load_state(store_state_path)
+            if len(store._beams_store) < 10:
+                store.print_beams_store()
+                print()
+            store.plot_list_frequencies(
+                store._beams_store,
+                figsize=(12, 8),
+                save_path=os.path.join(args.output_dir, "freq.pdf"),
+                verbose=True if accelerator.is_main_process else False,
+            )
+        else:
+            logger.info("Inserting corpus into data store...")
+            for batch in corpus_dataloader:
+                doc_ids = batch["doc_id"]
+                texts = batch["text"]
+                to_be_inserted = []
+                for doc_id, text in zip(doc_ids, texts):
+                    doc_id = doc_id.cpu().item()
+                    to_be_inserted.append(Document(text, {"doc_id": doc_id}))
+                store.insert(to_be_inserted)
+            if len(store._beams_store) < 10:
+                store.print_beams_store()
+                print()
+            store.save_state(store_state_path)
+            store.plot_list_frequencies(
+                store._beams_store,
+                figsize=(12, 8),
+                save_path=os.path.join(args.output_dir, "freq.pdf"),
+                verbose=True if accelerator.is_main_process else False,
+            )
+
+    # Wait for main process to finish, then all processes load
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        store.load_state(store_state_path)
+
     # Prepare everything with our accelerator
     (
         query_model,
         doc_model,
         optimizer,
-        corpus_dataloader,
         train_dataloader,
         lr_scheduler,
     ) = accelerator.prepare(
         query_model,
         doc_model,
         optimizer,
-        corpus_dataloader,
         train_dataloader,
         lr_scheduler,
     )
@@ -1275,54 +1324,6 @@ def ddp_process(args):
     if accelerator.is_main_process and args.do_report:
         tracker_name = args.tracker_name
         accelerator.init_trackers(tracker_name, config=vars(args))
-
-    store = SequencePrefixTreeIndexStore(
-        genx_transformer,
-        id_len=args.num_next_tokens,
-        universe=set(range(genx_transformer.inference_tokenizer.vocab_size)),
-        doc_prompt=corpus_prompt_template,
-        query_prompt=query_prompt_template,
-        mode="document_search",
-        insertion_depth=args.insertion_depth,
-    )
-    store.clear_store()
-    store.set_verbose_for_all(False)
-    global_rank = accelerator.state.process_index
-    store_state_path = os.path.join(
-        args.output_dir, f"rank{global_rank}-{args.store_state_filename}"
-    )
-    if args.load_store_state and os.path.exists(store_state_path):
-        logger.info("Loading state...")
-        store.load_state(store_state_path)
-        if len(store._beams_store) < 10:
-            store.print_beams_store()
-            print()
-        store.plot_list_frequencies(
-            store._beams_store,
-            figsize=(12, 8),
-            save_path=os.path.join(args.output_dir, f"rank{global_rank}-freq.pdf"),
-            verbose=True if accelerator.is_main_process else False,
-        )
-    else:
-        logger.info("Inserting corpus into data store...")
-        for batch in corpus_dataloader:
-            doc_ids = batch["doc_id"]
-            texts = batch["text"]
-            to_be_inserted = []
-            for doc_id, text in zip(doc_ids, texts):
-                doc_id = doc_id.cpu().item()
-                to_be_inserted.append(Document(text, {"doc_id": doc_id}))
-            store.insert(to_be_inserted)
-        if len(store._beams_store) < 10:
-            store.print_beams_store()
-            print()
-        store.save_state(store_state_path)
-        store.plot_list_frequencies(
-            store._beams_store,
-            figsize=(12, 8),
-            save_path=os.path.join(args.output_dir, f"rank{global_rank}-freq.pdf"),
-            verbose=True if accelerator.is_main_process else False,
-        )
 
     # Log some info about our training
     total_batch_size = (

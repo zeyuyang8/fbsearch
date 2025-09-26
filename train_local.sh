@@ -1,12 +1,13 @@
 #!/bin/bash
 
+export CUDA_VISIBLE_DEVICES=0,1
 export http_proxy=http://fwdproxy:8080
 export https_proxy=http://fwdproxy:8080
 export no_proxy=".fbcdn.net,.facebook.com,.thefacebook.com,.tfbnw.net,.fb.com,.fb"
 
-NUM_EPOCHS=(200 1000)
-NUM_BEAMS=(1)
-NUM_NEXT_TOKENS=(3 5)
+NUM_EPOCHS=(200 500)
+NUM_BEAMS=(3)
+NUM_NEXT_TOKENS=(5)
 
 for EPOCH in "${NUM_EPOCHS[@]}"
 do
@@ -19,13 +20,13 @@ do
             OUTPUT_DIR=runs/scifact/train-real-beam"$NUM_BEAM"-next"$NUM_NEXT_TOKEN"-epoch"$EPOCH"
             echo "OUTPUT_DIR: $OUTPUT_DIR"
 
-            torchrun --nproc_per_node=4 --master-port 2025 train.py \
+            torchrun --nproc_per_node=2 --master-port 2025 train.py \
                 --do_report true \
                 --corpus_filename corpus.jsonl \
                 --train_queries_filename claims_train.jsonl \
                 --dev_queries_filename claims_dev.jsonl \
                 --load_store_state true \
-                --tracker_name sep19 \
+                --tracker_name sep22 \
                 --learning_rate 5e-5 \
                 --num_train_epochs "$EPOCH" \
                 --validation_epochs 10 \
