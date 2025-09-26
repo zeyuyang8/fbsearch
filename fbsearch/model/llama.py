@@ -145,7 +145,7 @@ class FBSearchTransformer:
         prompts: str,
         model: AutoModelForCausalLM,
         tokenizer: PreTrainedTokenizer,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[str]]:
         assert tokenizer.padding_side == "left"
 
         model.eval()
@@ -174,7 +174,10 @@ class FBSearchTransformer:
             input_len = input_ids.shape[1]
             with torch.no_grad():
                 generated_tokens = model.generate(
-                    input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=tokenizer.eos_token_id,
+                    **gen_kwargs,
                 )
             pred_tokens = generated_tokens[:, input_len:]
             pred_tokens_list.append(pred_tokens[0])  # Remove batch dim
@@ -184,7 +187,8 @@ class FBSearchTransformer:
             )
             decoded_tokens_list.append(decoded)
 
-        # Pad pred_tokens_list to the same length
+        # Pad pred_tokens_list to the same length (they are already having the same length)
+        # this will return a 2D tensor with shape (batch_size, max_new_tokens)
         pred_tokens_padded = torch.nn.utils.rnn.pad_sequence(
             pred_tokens_list, batch_first=True, padding_value=tokenizer.pad_token_id
         )

@@ -1,10 +1,35 @@
+import hashlib
 import os
 
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import Dataset
 
 from ..model.llama import FBSearchTransformer
+from ..model.prompt import PromptFormat
+
+
+class CorpusDataset(Dataset):
+    def __init__(self, corpus: pd.DataFrame):
+        super().__init__()
+        if not corpus.index.name == "doc_id":
+            try:
+                corpus = corpus.set_index("doc_id")
+            except KeyError:
+                raise KeyError("Corpus must have a column named 'doc_id'")
+        self.corpus = corpus
+
+    def __len__(self):
+        return len(self.corpus)
+
+    def __getitem__(self, i):
+        doc_id = int(self.corpus.index[i])
+        content = self.corpus["content"][i]
+        return {
+            "doc_id": doc_id,
+            "content": content,
+        }
 
 
 class Query2DocumentDataset(Dataset):
@@ -56,22 +81,24 @@ def query2doc_collate_fn(batch):
     }
 
 
-def get_sample_query2doc_dataset():
-    file_dir = os.path.dirname(__file__)
+def get_sample_datasets(file_dir=None):
+    if file_dir is None:
+        file_dir = os.path.dirname(__file__)
     corpus_path = os.path.join(file_dir, "examples/retrieval/corpus.jsonl")
     query_path = os.path.join(file_dir, "examples/retrieval/queries.jsonl")
 
     corpus = pd.read_json(corpus_path, lines=True)
     queries = pd.read_json(query_path, lines=True)
 
+    corpus_dataset = CorpusDataset(corpus)
     query2doc_dataset = Query2DocumentDataset(queries, corpus)
-    return query2doc_dataset
+    return corpus_dataset, query2doc_dataset
 
 
 class PrefixTreeNode:
     def __init__(self):
         self.children = {}
-        self.doc_id = set()
+        self.doc_ids = set()
 
 
 class PrefixTreeStore:
@@ -79,7 +106,6 @@ class PrefixTreeStore:
         self,
         transformer: FBSearchTransformer = None,
         insertion_depth: int = 5,
-        columns: tuple[str, str] = ("doc_id", "content"),
     ):
         self.transformer = transformer
         self.root = PrefixTreeNode()
@@ -92,15 +118,17 @@ class PrefixTreeStore:
         doc_ids: list[int] = docs["doc_id"]
         contents: list[str] = docs["content"]
         genxs, tokens = self.transformer.index_doc(contents)
-        genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
+        if isinstance(genxs, torch.Tensor):
+            genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
 
         for i in range(len(doc_ids)):
             doc_id = doc_ids[i]
             content = contents[i]
             genx = genxs[i]
+            token = tokens[i]
 
             # Put into the data store
-            self.data_store[doc_id] = {"content": content, "genx": genx}
+            self.data_store[doc_id] = {"content": content, "genx": genx, "token": token}
 
             # Insert into the prefix tree
             self.traverse_and_insert(genx, doc_id)
@@ -119,10 +147,14 @@ class PrefixTreeStore:
 
     def query(self, queries: list[str]):
         genxs, tokens = self.transformer.index_query(queries)
+        if isinstance(genxs, torch.Tensor):
+            genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
+        results = []
         for i in range(len(queries)):
             genx = genxs[i]
-            results = self.traverse_and_search(genx)
-            yield results
+            result = self.traverse_and_search(genx)
+            results.append(result)
+        return results
 
     def traverse_and_search(self, genx: np.array):
         assert len(genx.shape) == 1
@@ -144,7 +176,126 @@ class PrefixTreeStore:
         return None
 
 
+def text_to_int_list(texts, n=5, num_range=10):
+    if not isinstance(texts, list):
+        texts = [texts]
+
+    results = []
+    for text in texts:
+        # Hash the input text using SHA256
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        # Convert the first n bytes to integers in the desired range
+        hashcode = [digest[i] % num_range for i in range(n)]
+        results.append(hashcode)
+
+    return results
+
+
+class HashTransformer:
+    def __init__(
+        self,
+        n=5,
+        num_range=4,
+        query_format: PromptFormat = None,
+        doc_format: PromptFormat = None,
+    ):
+        self.n = n
+        self.num_range = num_range
+        self.query_format = query_format
+        self.doc_format = doc_format
+
+    def index(self, prompts) -> tuple[np.array, list[str]]:
+        pred_tokens_padded = text_to_int_list(
+            prompts, n=self.n, num_range=self.num_range
+        )
+        decoded_tokens_list = []
+        for pred_tokens in pred_tokens_padded:
+            decoded_tokens = "".join([str(token) for token in pred_tokens])
+            decoded_tokens_list.append(decoded_tokens)
+
+        return np.array(pred_tokens_padded).astype(int), decoded_tokens_list
+
+    def index_doc(self, docs):
+        if self.doc_format is not None:
+            docs = self.doc_format.format(docs)
+
+        return self.index(docs)
+
+    def index_query(self, queries):
+        if self.query_format is not None:
+            queries = self.query_format.format(queries)
+        return self.index(queries)
+
+
 if __name__ == "__main__":
-    print("Running `python -m fbsearch.dataset.retrieval`")
-    query2doc_dataset = get_sample_query2doc_dataset()
-    print(query2doc_dataset[0])
+    print("Running `python -m fbsearch.store.retrieval`")
+    corpus_dataset, query2doc_dataset = get_sample_datasets()
+    corpus_data = {
+        "doc_id": [corpus_dataset[idx]["doc_id"] for idx in range(len(corpus_dataset))],
+        "content": [
+            corpus_dataset[idx]["content"] for idx in range(len(corpus_dataset))
+        ],
+    }
+    print("The first 3 elements in corpus sample data:")
+    print("IDs:", corpus_data["doc_id"][:3])
+    print("Contents:", corpus_data["content"][:3])
+
+    query2doc_data = {
+        "doc_id": sum(
+            [query2doc_dataset[idx]["doc_id"] for idx in range(len(query2doc_dataset))],
+            [],
+        ),
+        "query": sum(
+            [query2doc_dataset[idx]["query"] for idx in range(len(query2doc_dataset))],
+            [],
+        ),
+        "content": sum(
+            [
+                query2doc_dataset[idx]["content"]
+                for idx in range(len(query2doc_dataset))
+            ],
+            [],
+        ),
+    }
+    print()
+    print("Th first 2 elements in quer2doc sample data:")
+    print("IDs:", query2doc_data["doc_id"][:2])
+    print("Queries:", query2doc_data["query"][:2])
+    print("Contents:", query2doc_data["content"][:2])
+    print()
+
+    # Test using a simple hash transformer
+    def test_insert_and_query(n, num_range, insertion_depth):
+        print(
+            "=" * 40
+            + f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
+            + "=" * 40
+        )
+        fbsearch_transformer = HashTransformer(n=n, num_range=num_range)
+
+        # Test on the sample dataset
+        prefix_store = PrefixTreeStore(
+            fbsearch_transformer,
+            insertion_depth=insertion_depth,
+        )
+        prefix_store.insert(corpus_data)
+        print()
+        print("Data store after inserting the corpus:")
+        print(prefix_store.data_store)
+        print()
+
+        print("Testing the right queries:")
+        results = prefix_store.query(corpus_data["content"])
+        print(results)
+        print()
+
+        print("Testing on right and wrong queries:")
+        results = prefix_store.query(corpus_data["content"][:3] + ["wrong query"])
+        print(results)
+        print()
+
+    print("Simulate the case where the generated tokens are not diverse enough")
+    n = 5
+    num_range = 2
+    insertion_depth = 5
+    test_insert_and_query(n, num_range, insertion_depth)
