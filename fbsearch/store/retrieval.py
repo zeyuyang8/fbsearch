@@ -265,12 +265,13 @@ if __name__ == "__main__":
     print()
 
     # Test using a simple hash transformer
-    def test_insert_and_query(n, num_range, insertion_depth):
-        print(
-            "=" * 40
-            + f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
-            + "=" * 40
-        )
+    def test_insert_and_query(n, num_range, insertion_depth, msg):
+        specs = f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
+        print("*" * 80)
+        print(msg)
+        print(specs)
+        print("*" * 80)
+
         fbsearch_transformer = HashTransformer(n=n, num_range=num_range)
 
         # Test on the sample dataset
@@ -294,8 +295,16 @@ if __name__ == "__main__":
         print(results)
         print()
 
-    print("Simulate the case where the generated tokens are not diverse enough")
-    n = 5
-    num_range = 2
-    insertion_depth = 5
-    test_insert_and_query(n, num_range, insertion_depth)
+    test_insert_and_query(
+        n=5,
+        num_range=2,
+        insertion_depth=5,
+        msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **NOT** DIVERSE",
+    )
+
+    test_insert_and_query(
+        n=5,
+        num_range=10,
+        insertion_depth=5,
+        msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE",
+    )
