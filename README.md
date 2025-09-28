@@ -1,5 +1,15 @@
 # Generative Index
 
+Tasks:
+
+- Data query to doc - one to one? one to many? many to one? many to many?
+- Precision recall auto evaluation
+- Loss function and inference configurations to handle non-one-to-one searching
+- One model or multiple models?
+- Custom trainer
+- Linear attention later for efficiency
+- Conda on MAST
+
 ## Setup
 
 If on a devserver:

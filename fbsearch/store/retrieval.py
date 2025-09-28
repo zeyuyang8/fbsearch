@@ -9,6 +9,8 @@ from torch.utils.data import Dataset
 from ..model.llama import FBSearchTransformer
 from ..model.prompt import PromptFormat
 
+DEBUG = os.environ.get("DEBUG", False)
+
 
 class CorpusDataset(Dataset):
     def __init__(self, corpus: pd.DataFrame):
@@ -29,6 +31,23 @@ class CorpusDataset(Dataset):
         return {
             "doc_id": doc_id,
             "content": content,
+        }
+
+
+class QueryDataset(Dataset):
+    def __init__(self, queries: pd.DataFrame):
+        super().__init__()
+        self.queries = queries
+
+    def __len__(self):
+        return len(self.queries)
+
+    def __getitem__(self, i):
+        citations = self.queries["citations"][i]
+        query = self.queries["query"][i]
+        return {
+            "citations": citations,
+            "query": query,
         }
 
 
@@ -81,11 +100,11 @@ def query2doc_collate_fn(batch):
     }
 
 
-def get_sample_datasets(file_dir=None):
+def get_sample_datasets(file_dir=None, query_type="many2many"):
     if file_dir is None:
         file_dir = os.path.dirname(__file__)
     corpus_path = os.path.join(file_dir, "examples/retrieval/corpus.jsonl")
-    query_path = os.path.join(file_dir, "examples/retrieval/queries.jsonl")
+    query_path = os.path.join(file_dir, f"examples/retrieval/{query_type}.jsonl")
 
     corpus = pd.read_json(corpus_path, lines=True)
     queries = pd.read_json(query_path, lines=True)
@@ -156,6 +175,49 @@ class PrefixTreeStore:
             results.append(result)
         return results
 
+    def eval_with_query(self, queries: list[str], doc_ids: list[list[int]]):
+        results = self.query(queries)
+        metrics = {}
+
+        total_pred = 0
+        total_pred_correct = 0
+        total_labels = 0
+
+        for idx in range(len(results)):
+            result = results[idx]
+            labels = doc_ids[idx]
+
+            doc_ids_pred: list[int] = result["doc_ids"]
+            total_pred += len(doc_ids_pred)
+
+            doc_ids_true: list[int] = labels
+            total_labels += len(doc_ids_true)
+
+            n_pred_correct = len(doc_ids_pred.intersection(set(doc_ids_true)))
+            total_pred_correct += n_pred_correct
+            if DEBUG:
+                print("doc_ids_pred:", doc_ids_pred)
+                print("doc_ids_true:", doc_ids_true)
+                print("pred_correct:", n_pred_correct)
+
+        metrics["precision"] = 0
+        metrics["recall"] = 0
+        metrics["f1"] = 0
+
+        if total_pred > 0:
+            metrics["precision"] = total_pred_correct / total_pred
+        if total_labels > 0:
+            metrics["recall"] = total_pred_correct / total_labels
+        if total_pred_correct > 0:
+            metrics["f1"] = (
+                2
+                * metrics["precision"]
+                * metrics["recall"]
+                / (metrics["precision"] + metrics["recall"])
+            )
+
+        return results, metrics
+
     def traverse_and_search(self, genx: np.array):
         assert len(genx.shape) == 1
         node: PrefixTreeNode = self.root
@@ -173,7 +235,7 @@ class PrefixTreeStore:
 
         if found:
             return {"depth": depth, "doc_ids": node.doc_ids}
-        return None
+        return {"depth": -1, "doc_ids": set({})}
 
 
 def text_to_int_list(texts, n=5, num_range=10):
@@ -229,7 +291,7 @@ class HashTransformer:
 
 if __name__ == "__main__":
     print("Running `python -m fbsearch.store.retrieval`")
-    corpus_dataset, query2doc_dataset = get_sample_datasets()
+    corpus_dataset, query2doc_dataset = get_sample_datasets(query_type="many2many")
     corpus_data = {
         "doc_id": [corpus_dataset[idx]["doc_id"] for idx in range(len(corpus_dataset))],
         "content": [
@@ -267,10 +329,11 @@ if __name__ == "__main__":
     # Test using a simple hash transformer
     def test_insert_and_query(n, num_range, insertion_depth, msg):
         specs = f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
-        print("*" * 80)
+        print("#" * 100)
         print(msg)
         print(specs)
-        print("*" * 80)
+        print("#" * 100)
+        print()
 
         fbsearch_transformer = HashTransformer(n=n, num_range=num_range)
 
@@ -280,19 +343,22 @@ if __name__ == "__main__":
             insertion_depth=insertion_depth,
         )
         prefix_store.insert(corpus_data)
-        print()
-        print("Data store after inserting the corpus:")
-        print(prefix_store.data_store)
-        print()
+        if DEBUG:
+            print()
+            print("Data store after inserting the corpus:")
+            print(prefix_store.data_store)
+            print()
 
-        print("Testing the right queries:")
-        results = prefix_store.query(corpus_data["content"])
+        print("Testing on identical queries as the corpus plus a random query:")
+        queries = corpus_data["content"][:3] + ["wrong query with no match"]
+        doc_ids = [[doc_id] for doc_id in corpus_data["doc_id"][:3]] + [[]]
+        results, metrics = prefix_store.eval_with_query(
+            queries,
+            doc_ids,
+        )
+        print(doc_ids)
         print(results)
-        print()
-
-        print("Testing on right and wrong queries:")
-        results = prefix_store.query(corpus_data["content"][:3] + ["wrong query"])
-        print(results)
+        print(metrics)
         print()
 
     test_insert_and_query(
@@ -307,4 +373,11 @@ if __name__ == "__main__":
         num_range=10,
         insertion_depth=5,
         msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE",
+    )
+
+    test_insert_and_query(
+        n=5,
+        num_range=10,
+        insertion_depth=1,
+        msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE BUT THE INSERTION DEPTH IS SHALLOW",
     )
