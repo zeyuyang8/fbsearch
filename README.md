@@ -1,15 +1,5 @@
 # Generative Index
 
-Tasks:
-
-- Data query to doc - one to one? one to many? many to one? many to many?
-- Precision recall auto evaluation
-- Loss function and inference configurations to handle non-one-to-one searching
-- One model or multiple models?
-- Custom trainer
-- Linear attention later for efficiency
-- Conda on MAST
-
 ## Setup
 
 If on a devserver:
@@ -30,9 +20,11 @@ conda activate /home/zy45/.conda/envs/fbsearch
 
 Also set environment variable (CUDA version should be 12.8 if using the latest version of PyTorch):
 
-```
+```bash
 nano ~/.bashrc
 ```
+
+Then add the following lines and save:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.8
@@ -42,14 +34,24 @@ export PATH=$CUDA_HOME/bin:$PATH
 export WANDB_API_KEY="..."
 export HF_HUB_DISABLE_XET=1
 export HF_TOKEN="..."
+```
+
+Before running a shell script, make sure to set the environment variable at the beginning of the script:
+
+```bash
+#!/bin/bash
+
 export http_proxy=http://fwdproxy:8080
 export https_proxy=http://fwdproxy:8080
 export no_proxy=".fbcdn.net,.facebook.com,.thefacebook.com,.tfbnw.net,.fb.com,.fb"
 ```
 
+Do not set the above environment variables in your `.bashrc` file, as it will cause some network requests to fail.
+
+## Useful Commands
 
 Convert your notebook to script:
 
 ```bash
-jupyter nbconvert --to python debug.ipynb --PythonExporter.exclude_markdown=True --TagRemovePreprocessor.remove_cell_tags="['notebook_only']" --log-level ERROR
+jupyter nbconvert --to python notebook.ipynb --PythonExporter.exclude_markdown=True --TagRemovePreprocessor.remove_cell_tags="['notebook_only']" --log-level ERROR
 ```
