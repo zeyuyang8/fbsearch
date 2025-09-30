@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from ..model.llama import FBSearchTransformer
 from ..model.prompt import PromptFormat
@@ -29,9 +29,15 @@ class CorpusDataset(Dataset):
         doc_id = int(self.corpus.index[i])
         content = self.corpus["content"][i]
         return {
-            "doc_id": doc_id,
+            "doc_id": int(doc_id),
             "content": content,
         }
+
+
+def corpus_collate_fn(batch):
+    doc_ids = [item["doc_id"] for item in batch]
+    texts = [item["content"] for item in batch]
+    return {"doc_id": doc_ids, "content": texts}
 
 
 class QueryDataset(Dataset):
@@ -46,9 +52,16 @@ class QueryDataset(Dataset):
         citations = self.queries["citations"][i]
         query = self.queries["query"][i]
         return {
-            "citations": citations,
+            "doc_id": citations,
             "query": query,
         }
+
+
+def query_collate_fn(batch):
+    queries = [item["query"] for item in batch]
+    citations = [item["doc_id"] for item in batch]
+
+    return {"query": queries, "doc_id": citations}
 
 
 class Query2DocumentDataset(Dataset):
@@ -87,6 +100,11 @@ class Query2DocumentDataset(Dataset):
 
 
 def query2doc_collate_fn(batch):
+    """
+    This handles the case where within a batch, queries map to variable number of documents.
+    For example, query1 maps to doc1, and query2 maps to doc2, doc3.
+    Then, the batch will be like: (query1, doc1), (query2, doc2), (query2, doc3).
+    """
     batch = [item for item in batch if item]
     if not batch:
         return {}
@@ -100,7 +118,7 @@ def query2doc_collate_fn(batch):
     }
 
 
-def get_sample_datasets(file_dir=None, query_type="many2many"):
+def get_sample_datasets(file_dir=None, query_type="many2many", batch_size=1024):
     if file_dir is None:
         file_dir = os.path.dirname(__file__)
     corpus_path = os.path.join(file_dir, "examples/retrieval/corpus.jsonl")
@@ -110,8 +128,32 @@ def get_sample_datasets(file_dir=None, query_type="many2many"):
     queries = pd.read_json(query_path, lines=True)
 
     corpus_dataset = CorpusDataset(corpus)
+    corpus_dataloader = DataLoader(
+        corpus_dataset, batch_size=batch_size, collate_fn=corpus_collate_fn
+    )
+
+    query_dataset = QueryDataset(queries)
+    query_dataloader = DataLoader(
+        query_dataset, batch_size=batch_size, collate_fn=query_collate_fn
+    )
+
     query2doc_dataset = Query2DocumentDataset(queries, corpus)
-    return corpus_dataset, query2doc_dataset
+    query2doc_dataloader = DataLoader(
+        query2doc_dataset, batch_size=batch_size, collate_fn=query2doc_collate_fn
+    )
+
+    datas = {
+        "corpus": next(iter(corpus_dataloader)),
+        "query": next(iter(query_dataloader)),
+        "query2doc": next(iter(query2doc_dataloader)),
+        "corpus_dataset": corpus_dataset,
+        "query_dataset": query_dataset,
+        "query2doc_dataset": query2doc_dataset,
+        "corpus_collate_fn": corpus_collate_fn,
+        "query_collate_fn": query_collate_fn,
+        "query2doc_collate_fn": query2doc_collate_fn,
+    }
+    return datas
 
 
 class PrefixTreeNode:
@@ -133,10 +175,11 @@ class PrefixTreeStore:
         # {0: {"content": "This is a test document.", "genx": [[0, 1, 2], [1, 2, 3]]}, ...}
         self.data_store = {}
 
-    def insert(self, docs):
+    def insert(self, docs, genxs=None, tokens=None):
         doc_ids: list[int] = docs["doc_id"]
         contents: list[str] = docs["content"]
-        genxs, tokens = self.transformer.index_doc(contents)
+        if genxs is None and tokens is None:
+            genxs, tokens = self.transformer.index_doc(contents)
         if isinstance(genxs, torch.Tensor):
             genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
 
@@ -164,19 +207,22 @@ class PrefixTreeStore:
             if depth >= self.insertion_depth:
                 node.doc_ids.add(doc_id)
 
-    def query(self, queries: list[str]):
-        genxs, tokens = self.transformer.index_query(queries)
+    def query(self, queries: list[str], genxs=None, tokens=None):
+        if genxs is None and tokens is None:
+            genxs, tokens = self.transformer.index_query(queries)
         if isinstance(genxs, torch.Tensor):
             genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
         results = []
         for i in range(len(queries)):
             genx = genxs[i]
             result = self.traverse_and_search(genx)
+            result["genx"] = genxs[i]
+            result["token"] = tokens[i]
             results.append(result)
         return results
 
-    def eval_with_query(self, queries: list[str], doc_ids: list[list[int]]):
-        results = self.query(queries)
+    @staticmethod
+    def results2metrics(doc_ids: list[list[int]], results: list[dict]):
         metrics = {}
 
         total_pred = 0
@@ -217,6 +263,16 @@ class PrefixTreeStore:
             )
 
         return results, metrics
+
+    def eval_with_query(
+        self,
+        queries: list[str],
+        doc_ids: list[list[int]],
+        genxs=None,
+        tokens=None,
+    ):
+        results = self.query(queries, genxs, tokens)
+        return self.results2metrics(doc_ids, results)
 
     def traverse_and_search(self, genx: np.array):
         assert len(genx.shape) == 1
@@ -289,50 +345,19 @@ class HashTransformer:
         return self.index(queries)
 
 
-if __name__ == "__main__":
-    print("Running `python -m fbsearch.store.retrieval`")
-    corpus_dataset, query2doc_dataset = get_sample_datasets(query_type="many2many")
-    corpus_data = {
-        "doc_id": [corpus_dataset[idx]["doc_id"] for idx in range(len(corpus_dataset))],
-        "content": [
-            corpus_dataset[idx]["content"] for idx in range(len(corpus_dataset))
-        ],
-    }
-    print("The first 3 elements in corpus sample data:")
-    print("IDs:", corpus_data["doc_id"][:3])
-    print("Contents:", corpus_data["content"][:3])
+def _test_prefix_tree_store():
+    from termcolor import colored
 
-    query2doc_data = {
-        "doc_id": sum(
-            [query2doc_dataset[idx]["doc_id"] for idx in range(len(query2doc_dataset))],
-            [],
-        ),
-        "query": sum(
-            [query2doc_dataset[idx]["query"] for idx in range(len(query2doc_dataset))],
-            [],
-        ),
-        "content": sum(
-            [
-                query2doc_dataset[idx]["content"]
-                for idx in range(len(query2doc_dataset))
-            ],
-            [],
-        ),
-    }
-    print()
-    print("Th first 2 elements in quer2doc sample data:")
-    print("IDs:", query2doc_data["doc_id"][:2])
-    print("Queries:", query2doc_data["query"][:2])
-    print("Contents:", query2doc_data["content"][:2])
-    print()
+    datas = get_sample_datasets(query_type="one2one")
+    corpus_data = datas["corpus"]
 
     # Test using a simple hash transformer
     def test_insert_and_query(n, num_range, insertion_depth, msg):
         specs = f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
-        print("#" * 100)
-        print(msg)
-        print(specs)
-        print("#" * 100)
+        print(colored("#" * 100, "grey"))
+        print(colored(msg, "green"))
+        print(colored(specs, "blue"))
+        print(colored("#" * 100, "grey"))
         print()
 
         fbsearch_transformer = HashTransformer(n=n, num_range=num_range)
@@ -356,9 +381,9 @@ if __name__ == "__main__":
             queries,
             doc_ids,
         )
-        print(doc_ids)
-        print(results)
-        print(metrics)
+        print("True:", doc_ids)
+        print("Pred:", results)
+        print(colored(f"Stat: {metrics}", "red"))
         print()
 
     test_insert_and_query(
@@ -381,3 +406,8 @@ if __name__ == "__main__":
         insertion_depth=1,
         msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE BUT THE INSERTION DEPTH IS SHALLOW",
     )
+
+
+if __name__ == "__main__":
+    print("Running `python -m fbsearch.store.retrieval`")
+    _test_prefix_tree_store()

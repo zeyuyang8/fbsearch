@@ -140,6 +140,11 @@ class FBSearchTransformer:
         self.query_format = query_format
         self.doc_format = doc_format
 
+    def to(self, device):
+        self.query_model.to(device)
+        self.doc_model.to(device)
+        return self
+
     def index(
         self,
         prompts: str,
@@ -173,7 +178,14 @@ class FBSearchTransformer:
             attention_mask = batch["attention_mask"].to(device)
             input_len = input_ids.shape[1]
             with torch.no_grad():
-                generated_tokens = model.generate(
+                if hasattr(model, "module") and isinstance(
+                    model, torch.nn.parallel.DistributedDataParallel
+                ):
+                    gen_model = model.module
+                else:
+                    gen_model = model
+
+                generated_tokens = gen_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     pad_token_id=tokenizer.eos_token_id,
@@ -271,49 +283,34 @@ class FBSearchTransformer:
         return outputs.loss
 
 
-if __name__ == "__main__":
-    print("Running `python -m fbsearch.model.llama`")
-    model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-    model_max_length = 2048
-
-    # Document transformer
+def get_fbsearch_transformer(
+    doc_model_name_or_path: str,
+    query_model_name_or_path: str,
+    model_max_length: int = 2048,
+    doc_prompt_before: str = "Document: ",
+    doc_prompt_after: str = "Task: Generate a summary with several words. Directly say the words without explanation.",
+    query_prompt_before: str = "Query: ",
+    query_prompt_after: str = "Task: Guess you answer with several words. Directly say the words without explanation.",
+    dtype: torch.dtype = torch.bfloat16,
+):
     doc_model, eval_tokenizer = get_llm_and_tokenizer(
-        model_name_or_path,
+        doc_model_name_or_path,
         mode="eval",
         model_max_length=model_max_length,
     )
-
-    print(f"eval_tokenizer.model_max_length: {eval_tokenizer.model_max_length}")
-    print(f"eval_tokenizer.padding_side: {eval_tokenizer.padding_side}")
-    doc_model_num_params = sum(p.numel() for p in doc_model.parameters())
-    print(f"doc_model.num_params: {doc_model_num_params:,}")
-
-    doc_model.to("cuda")
-
-    # Query transformer
     query_model, train_tokenizer = get_llm_and_tokenizer(
-        model_name_or_path,
+        query_model_name_or_path,
         mode="train",
         model_max_length=model_max_length,
     )
-    print(f"train_tokenizer.model_max_length: {train_tokenizer.model_max_length}")
-    print(f"train_tokenizer.padding_side: {train_tokenizer.padding_side}")
-    query_model_num_params = sum(p.numel() for p in query_model.parameters())
-    print(f"query_model.num_params: {query_model_num_params:,}")
-
-    query_model.to("cuda")
-
-    # Prompt format
-    query_format = PromptFormat(
-        before="Query: ",
-        after="Task: Guess you answer with several words. Directly say the words without explanation.",
-    )
     doc_format = PromptFormat(
-        before="Document: ",
-        after="Task: Generate a summary with several words. Directly say the words without explanation.",
+        before=doc_prompt_before,
+        after=doc_prompt_after,
     )
-
-    # Search transformer
+    query_format = PromptFormat(
+        before=query_prompt_before,
+        after=query_prompt_after,
+    )
     fbsearch_transformer = FBSearchTransformer(
         query_model=query_model,
         doc_model=doc_model,
@@ -322,6 +319,20 @@ if __name__ == "__main__":
         query_format=query_format,
         doc_format=doc_format,
     )
+    return fbsearch_transformer
+
+
+if __name__ == "__main__":
+    print("Running `python -m fbsearch.model.llama`")
+    model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+    model_max_length = 2048
+
+    # FBSearch transformer
+    fbsearch_transformer = get_fbsearch_transformer(
+        doc_model_name_or_path=model_name_or_path,
+        query_model_name_or_path=model_name_or_path,
+        model_max_length=model_max_length,
+    ).to("cuda")
 
     # Test indexing docs and queries
     docs = ["The capital of France is Paris.", "Micheal Jordan is the GOAT."]

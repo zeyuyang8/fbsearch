@@ -35,3 +35,4 @@ recordlinkage
 
 # General
 deprecated
+termcolor
