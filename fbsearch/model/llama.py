@@ -1,6 +1,7 @@
 import os
 
 import torch
+import transformers.utils.logging as transformers_utils_logging
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 
 from .prompt import PromptFormat
@@ -13,6 +14,7 @@ def smart_tokenizer_and_embedding_resize(
     tokenizer,
     model,
 ):
+    transformers_utils_logging.set_verbosity_error()
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
 
@@ -130,6 +132,7 @@ class FBSearchTransformer:
         eval_tokenizer: PreTrainedTokenizer = None,
         query_format: PromptFormat = None,
         doc_format: PromptFormat = None,
+        caching: bool = True,
     ):
         self.query_model = query_model
         self.doc_model = doc_model
@@ -139,6 +142,9 @@ class FBSearchTransformer:
 
         self.query_format = query_format
         self.doc_format = doc_format
+
+        if caching:
+            self.doc_cache = {}
 
     def to(self, device):
         self.query_model.to(device)
@@ -150,6 +156,7 @@ class FBSearchTransformer:
         prompts: str,
         model: AutoModelForCausalLM,
         tokenizer: PreTrainedTokenizer,
+        mode: str = "query",
     ) -> tuple[torch.Tensor, list[str]]:
         assert tokenizer.padding_side == "left"
 
@@ -169,6 +176,17 @@ class FBSearchTransformer:
         pred_tokens_list = []
         decoded_tokens_list = []
         for prompt in prompts:
+            if (
+                self.doc_cache is not None
+                and mode == "doc"
+                and prompt in self.doc_cache
+            ):
+                pred_tokens, decoded = self.doc_cache[prompt]
+                pred_tokens = pred_tokens.to(device)
+                pred_tokens_list.append(pred_tokens)
+                decoded_tokens_list.append(decoded)
+                continue
+
             batch = tokenizer(
                 prompt,
                 return_tensors="pt",
@@ -191,13 +209,21 @@ class FBSearchTransformer:
                     pad_token_id=tokenizer.eos_token_id,
                     **gen_kwargs,
                 )
-            pred_tokens = generated_tokens[:, input_len:]
-            pred_tokens_list.append(pred_tokens[0])  # Remove batch dim
+            pred_tokens = generated_tokens[:, input_len:][0]  # Remove batch dim
+            pred_tokens_list.append(pred_tokens)
             decoded = tokenizer.decode(
-                pred_tokens[0],
+                pred_tokens,
                 skip_special_tokens=True,
             )
             decoded_tokens_list.append(decoded)
+
+            if self.doc_cache is not None and mode == "doc":
+                # Make sure the doc model is freezed, otherwise we should not cache it
+                all_frozen = all(
+                    not param.requires_grad for param in self.doc_model.parameters()
+                )
+                assert all_frozen, "Model must be frozen for caching"
+                self.doc_cache[prompt] = (pred_tokens.cpu(), decoded)
 
         # Pad pred_tokens_list to the same length (they are already having the same length)
         # this will return a 2D tensor with shape (batch_size, max_new_tokens)
@@ -212,7 +238,7 @@ class FBSearchTransformer:
         if self.doc_format is not None:
             docs = self.doc_format.format(docs)
 
-        return self.index(docs, self.doc_model, self.eval_tokenizer)
+        return self.index(docs, self.doc_model, self.eval_tokenizer, mode="doc")
 
     def index_query(self, queries: list[str]):
         assert self.eval_tokenizer.padding_side == "left"
@@ -220,7 +246,7 @@ class FBSearchTransformer:
         if self.query_format is not None:
             queries = self.query_format.format(queries)
 
-        return self.index(queries, self.query_model, self.eval_tokenizer)
+        return self.index(queries, self.query_model, self.eval_tokenizer, mode="query")
 
     def compute_loss(self, queries: list[str], docs: list[str]):
         assert self.eval_tokenizer.padding_side == "left"

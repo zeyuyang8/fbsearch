@@ -1,5 +1,8 @@
 import hashlib
 import os
+from collections import Counter
+
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -10,6 +13,7 @@ from ..model.llama import FBSearchTransformer
 from ..model.prompt import PromptFormat
 
 DEBUG = os.environ.get("DEBUG", False)
+plt.rcParams["font.family"] = "DejaVu Sans"
 
 
 class CorpusDataset(Dataset):
@@ -292,6 +296,122 @@ class PrefixTreeStore:
         if found:
             return {"depth": depth, "doc_ids": node.doc_ids}
         return {"depth": -1, "doc_ids": set({})}
+
+    @staticmethod
+    def plot_list_frequencies(
+        data_store,
+        figsize=(12, 8),
+        show_top_n=10,
+        save_path=None,
+    ):
+        # Extract all tokens from the data store
+        all_tokens = []
+        for result_dict in data_store.values():
+            all_tokens.append(result_dict["token"])
+
+        if not all_tokens:
+            print("No data found in the input dictionary.")
+            fig = plt.figure(figsize=figsize)
+            return None, fig
+
+        # Count frequencies of each unique token
+        token_frequencies = Counter(all_tokens)
+
+        # Count the frequency of frequencies (meta-frequency distribution)
+        frequency_distribution = Counter(token_frequencies.values())
+
+        # Create the figure and axes
+        fig, axes = plt.subplots(2, 1, figsize=figsize)
+
+        # Plot 1: Distribution of frequency counts
+        frequency_values = sorted(frequency_distribution.keys())
+        frequency_counts = [frequency_distribution[freq] for freq in frequency_values]
+
+        axes[0].bar(
+            frequency_values,
+            frequency_counts,
+            color="lightblue",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        axes[0].set_xlabel("Frequency Count", fontsize=24)
+        axes[0].set_ylabel("Number of Tokens", fontsize=24)
+        axes[0].set_title("Distribution of Token Frequencies", fontsize=28)
+        axes[0].grid(axis="y", linestyle="--", alpha=0.6)
+        axes[0].tick_params(axis="x", labelsize=20)
+        axes[0].tick_params(axis="y", labelsize=20)
+
+        # Plot 2: Histogram of all frequency values
+        all_frequency_values = list(token_frequencies.values())
+        max_frequency = max(all_frequency_values)
+        axes[1].hist(
+            all_frequency_values,
+            bins=range(1, max_frequency + 2),
+            rwidth=0.8,
+            align="left",
+            color="lightcoral",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        axes[1].set_xlabel("Frequency", fontsize=24)
+        axes[1].set_ylabel("Count", fontsize=24)
+        axes[1].set_title("Histogram of Token Frequencies", fontsize=28)
+        axes[1].grid(axis="y", linestyle="--", alpha=0.6)
+        axes[1].tick_params(axis="x", labelsize=20)
+        axes[1].tick_params(axis="y", labelsize=20)
+
+        plt.tight_layout()
+
+        # Save or show the plot
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+
+        # Calculate statistics
+        stats = {
+            "total_tokens": len(all_tokens),
+            "unique_tokens": len(token_frequencies),
+            "tokens_appearing_once": frequency_distribution.get(1, 0),
+            "tokens_appearing_multiple": sum(
+                count for freq, count in frequency_distribution.items() if freq > 1
+            ),
+            "max_frequency": max(all_frequency_values),
+            "frequency_distribution": dict(frequency_distribution),
+        }
+
+        # Print statistics
+        print("Summary Statistics:")
+        print(f"Total number of tokens: {stats['total_tokens']}")
+        print(f"Number of unique tokens: {stats['unique_tokens']}")
+        print(f"Tokens appearing once: {stats['tokens_appearing_once']}")
+        print(f"Tokens appearing more than once: {stats['tokens_appearing_multiple']}")
+        print(f"Maximum frequency: {stats['max_frequency']}")
+
+        # Show top frequent tokens
+        if len(token_frequencies) <= show_top_n * 2:
+            print("\nAll unique tokens and their frequencies:")
+            for i, (unique_token, frequency_count) in enumerate(
+                sorted(token_frequencies.items(), key=lambda x: x[1], reverse=True), 1
+            ):
+                print(f"{i:2d}: {unique_token} appears {frequency_count} time(s)")
+        else:
+            print(f"\nTop {show_top_n} most frequent tokens:")
+            for i, (unique_token, frequency_count) in enumerate(
+                sorted(token_frequencies.items(), key=lambda x: x[1], reverse=True)[
+                    :show_top_n
+                ],
+                1,
+            ):
+                print(f"{i:2d}: {unique_token} appears {frequency_count} time(s)")
+
+        print("\nFrequency distribution:")
+        for frequency_value in sorted(frequency_distribution.keys()):
+            token_count = frequency_distribution[frequency_value]
+            print(f"{token_count} tokens appear exactly {frequency_value} time(s)")
+
+        return stats, fig
 
 
 def text_to_int_list(texts, n=5, num_range=10):

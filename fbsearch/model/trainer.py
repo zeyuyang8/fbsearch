@@ -20,8 +20,8 @@ from tqdm import tqdm
 from transformers import get_scheduler, HfArgumentParser
 from transformers.trainer_utils import seed_worker
 
-from ..store.retrieval import PrefixTreeStore
-from .llama import FBSearchTransformer
+from ..store.retrieval import get_sample_datasets, PrefixTreeStore
+from .llama import FBSearchTransformer, get_fbsearch_transformer
 
 DEBUG = os.environ.get("DEBUG", False)
 
@@ -48,14 +48,16 @@ class FBSearchTrainingArguments:
     # Accelerator
     mixed_precision: str = field(default="bf16")
     report_to: str = field(default="wandb")
+    do_report: bool = field(default=True)
 
     # Seed
     seed: int = field(default=0)
 
     # Logging
     logging_dir: str = field(default="logs")
-    tracker_name: str = field(default="scifact")
-    do_report: bool = field(default=False)
+    tracker_name: str = field(default="tiny")
+    run_name: str = field(default="many2many")
+    run_tags: list[str] = field(default_factory=list)
     output_dir: str = field(default="runs")
 
     # Dataloader
@@ -217,6 +219,10 @@ class FBSearchTrainer:
 
     def train(self):
         args: FBSearchTrainingArguments = self.args
+        self.plotted = False
+
+        # Make a directory for outputs
+        os.makedirs(args.output_dir, exist_ok=True)
 
         # Init accelerator
         accelerator: Accelerator = self.init_accelerator()
@@ -226,6 +232,9 @@ class FBSearchTrainer:
 
         # Create optimizer and scheduler
         train_configs = self.create_optimizer_and_scheduler()
+        self.init_trackers()
+        self.logger_info_dict(train_configs)
+
         max_train_steps = train_configs["max_train_steps"]
         num_train_epochs = train_configs["num_train_epochs"]
         checkpointing_steps = train_configs["checkpointing_steps"]
@@ -250,7 +259,7 @@ class FBSearchTrainer:
             for _, batch in enumerate(self.train_dataloader):
                 models_to_accumulate = [self.transformer.query_model]
                 with accelerator.accumulate(models_to_accumulate):
-                    loss = self.training_step(batch)
+                    loss, logs = self.training_step(batch)
 
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
@@ -264,10 +273,6 @@ class FBSearchTrainer:
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                logs = {
-                    "loss": loss.detach().item(),
-                    "lr": self.lr_scheduler.get_last_lr()[0],
-                }
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
@@ -404,11 +409,7 @@ class FBSearchTrainer:
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
         checkpointing_steps = args.checkpointing_epochs * num_update_steps_per_epoch
 
-        if accelerator.is_main_process and args.do_report:
-            tracker_name = args.tracker_name
-            accelerator.init_trackers(tracker_name, config=vars(self.args))
-
-        self.train_configs = {
+        train_configs = {
             "num_examples": len(self.train_dataloader.dataset),
             "num_batches_per_epoch": len(self.train_dataloader),
             "num_train_epochs": num_train_epochs,
@@ -421,10 +422,20 @@ class FBSearchTrainer:
             "validation_epochs": args.validation_epochs,
             "checkpointing_steps": checkpointing_steps,
         }
-        self.log_dict(self.train_configs)
-        return self.train_configs
+        return train_configs
 
-    def log_dict(self, dict):
+    def init_trackers(self):
+        args = self.args
+        accelerator = self.accelerator
+        if accelerator.is_main_process and args.do_report:
+            tracker_name = args.tracker_name
+            accelerator.init_trackers(
+                tracker_name,
+                config=vars(self.args),
+                init_kwargs={"wandb": {"name": args.run_name, "tags": args.run_tags}},
+            )
+
+    def logger_info_dict(self, dict):
         for key, value in dict.items():
             logger.info(f"{key}: {value}")
 
@@ -441,13 +452,26 @@ class FBSearchTrainer:
         self.optimizer.zero_grad()
         loss = self.compute_loss(batch)
         accelerator.backward(loss)
+
+        grad_norm = None
         if accelerator.sync_gradients:
             params_to_clip = itertools.chain(self.transformer.query_model.parameters())
-            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+            grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
         self.optimizer.step()
         self.lr_scheduler.step()
-        return loss
+
+        # Create logs with gradient norm
+        logs = {
+            "loss": loss.detach().item(),
+            "lr": self.lr_scheduler.get_last_lr()[0],
+        }
+
+        # Add gradient norm if available
+        if grad_norm is not None:
+            logs["grad_norm"] = grad_norm.item()
+
+        return loss, logs
 
     def evaluate(self, corpus_dataloader, eval_dataloader, **kwargs):
         global_step = kwargs.get("global_step", None)
@@ -473,6 +497,31 @@ class FBSearchTrainer:
                     ga_genxs,
                     ga_tokens,
                 )
+
+        if accelerator.is_main_process:
+            plot_path = os.path.join(args.output_dir, "frequencies.pdf")
+            if not self.plotted:
+                token_stats, stats_fig = store.plot_list_frequencies(
+                    store.data_store,
+                    save_path=plot_path,
+                )
+                self.plotted = True
+
+                # Find wandb tracker and log table
+                wandb_tracker = next(
+                    (t for t in self.accelerator.trackers if t.name == "wandb"), None
+                )
+                if wandb_tracker:
+                    import wandb
+
+                    wandb_tracker.log(
+                        {
+                            "token_freq_fig": wandb.Image(
+                                stats_fig, caption="Token Frequency"
+                            )
+                        },
+                        commit=False,  # Don't create/advance to new step
+                    )
 
         if accelerator.is_main_process:
             all_doc_ids = []
@@ -502,20 +551,19 @@ class FBSearchTrainer:
 
 
 if __name__ == "__main__":
-    print("Running `torchrun --nproc_per_node=2 -m fbsearch.model.trainer`")
-    from ..store.retrieval import get_sample_datasets
-    from .llama import get_fbsearch_transformer
+    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --run_name many2many --run_tags tiny`
+    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --run_name one2one --run_tags tiny`
 
-    datas = get_sample_datasets(query_type="one2one")
+    parser = HfArgumentParser((FBSearchTrainingArguments))
+    (args,) = parser.parse_args_into_dataclasses()
+
+    datas = get_sample_datasets(query_type=args.run_name)
     train_dataset = datas["query2doc_dataset"]
     train_collate_fn = datas["query2doc_collate_fn"]
     eval_dataset = datas["query_dataset"]
     eval_collate_fn = datas["query_collate_fn"]
     corpus_dataset = datas["corpus_dataset"]
     corpus_collate_fn = datas["corpus_collate_fn"]
-
-    parser = HfArgumentParser((FBSearchTrainingArguments))
-    (args,) = parser.parse_args_into_dataclasses()
 
     transformer = get_fbsearch_transformer(
         doc_model_name_or_path=args.doc_model_name_or_path,
