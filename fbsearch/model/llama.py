@@ -1,3 +1,4 @@
+import copy
 import os
 
 import torch
@@ -133,6 +134,9 @@ class FBSearchTransformer:
         query_format: PromptFormat = None,
         doc_format: PromptFormat = None,
         caching: bool = True,
+        num_next_tokens: int = 5,
+        num_beams_doc: int = 1,
+        num_beams_query: int = 1,
     ):
         self.query_model = query_model
         self.doc_model = doc_model
@@ -143,8 +147,27 @@ class FBSearchTransformer:
         self.query_format = query_format
         self.doc_format = doc_format
 
+        self.caching = caching
+        self.doc_cache = {}
         if caching:
-            self.doc_cache = {}
+            self.doc_model.requires_grad_(False)
+
+        self.num_next_tokens = num_next_tokens
+        self.num_beams_doc = num_beams_doc
+        self.num_beams_query = num_beams_query
+
+        gen_kwargs = {
+            "min_new_tokens": num_next_tokens,
+            "max_new_tokens": num_next_tokens,
+            "do_sample": False,
+        }
+        self.doc_gen_kwargs = copy.deepcopy(gen_kwargs)
+        self.doc_gen_kwargs["num_beams"] = num_beams_doc
+        self.doc_gen_kwargs["num_return_sequences"] = num_beams_doc
+
+        self.query_gen_kwargs = copy.deepcopy(gen_kwargs)
+        self.query_gen_kwargs["num_beams"] = num_beams_query
+        self.query_gen_kwargs["num_return_sequences"] = num_beams_query
 
     def to(self, device):
         self.query_model.to(device)
@@ -156,7 +179,8 @@ class FBSearchTransformer:
         prompts: str,
         model: AutoModelForCausalLM,
         tokenizer: PreTrainedTokenizer,
-        mode: str = "query",
+        gen_kwargs: dict,
+        mode: str,
     ) -> tuple[torch.Tensor, list[str]]:
         assert tokenizer.padding_side == "left"
 
@@ -165,14 +189,6 @@ class FBSearchTransformer:
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        gen_kwargs = {
-            "min_new_tokens": 5,
-            "max_new_tokens": 5,
-            "do_sample": False,
-            "num_beams": 1,
-            "num_return_sequences": 1,
-        }
-
         pred_tokens_list = []
         decoded_tokens_list = []
         for prompt in prompts:
@@ -180,11 +196,12 @@ class FBSearchTransformer:
                 self.doc_cache is not None
                 and mode == "doc"
                 and prompt in self.doc_cache
+                and self.caching
             ):
                 pred_tokens, decoded = self.doc_cache[prompt]
                 pred_tokens = pred_tokens.to(device)
-                pred_tokens_list.append(pred_tokens)
-                decoded_tokens_list.append(decoded)
+                pred_tokens_list += pred_tokens
+                decoded_tokens_list += decoded
                 continue
 
             batch = tokenizer(
@@ -209,15 +226,15 @@ class FBSearchTransformer:
                     pad_token_id=tokenizer.eos_token_id,
                     **gen_kwargs,
                 )
-            pred_tokens = generated_tokens[:, input_len:][0]  # Remove batch dim
-            pred_tokens_list.append(pred_tokens)
-            decoded = tokenizer.decode(
+            pred_tokens = generated_tokens[:, input_len:]
+            pred_tokens_list += pred_tokens
+            decoded = tokenizer.batch_decode(
                 pred_tokens,
                 skip_special_tokens=True,
             )
-            decoded_tokens_list.append(decoded)
+            decoded_tokens_list += decoded
 
-            if self.doc_cache is not None and mode == "doc":
+            if self.doc_cache is not None and mode == "doc" and self.caching:
                 # Make sure the doc model is freezed, otherwise we should not cache it
                 all_frozen = all(
                     not param.requires_grad for param in self.doc_model.parameters()
@@ -238,7 +255,8 @@ class FBSearchTransformer:
         if self.doc_format is not None:
             docs = self.doc_format.format(docs)
 
-        return self.index(docs, self.doc_model, self.eval_tokenizer, mode="doc")
+        gen_kwargs = copy.deepcopy(self.doc_gen_kwargs)
+        return self.index(docs, self.doc_model, self.eval_tokenizer, gen_kwargs, "doc")
 
     def index_query(self, queries: list[str]):
         assert self.eval_tokenizer.padding_side == "left"
@@ -246,7 +264,10 @@ class FBSearchTransformer:
         if self.query_format is not None:
             queries = self.query_format.format(queries)
 
-        return self.index(queries, self.query_model, self.eval_tokenizer, mode="query")
+        gen_kwargs = copy.deepcopy(self.query_gen_kwargs)
+        return self.index(
+            queries, self.query_model, self.eval_tokenizer, gen_kwargs, "query"
+        )
 
     def compute_loss(self, queries: list[str], docs: list[str]):
         assert self.eval_tokenizer.padding_side == "left"
@@ -271,9 +292,16 @@ class FBSearchTransformer:
             print(targets_mask)
             print()
 
+        # Match the beams for documents
+        num_beams_doc = self.doc_gen_kwargs["num_beams"]
+        queries = [x for x in queries for _ in range(num_beams_doc)]
+        if DEBUG:
+            print(queries)
+
         # Remember to format queries before computing loss
         if self.query_format is not None:
             queries = self.query_format.format(queries)
+
         sources = self.train_tokenizer(
             queries,
             return_tensors="pt",
@@ -317,6 +345,10 @@ def get_fbsearch_transformer(
     doc_prompt_after: str = "Task: Generate a summary with several words. Directly say the words without explanation.",
     query_prompt_before: str = "Query: ",
     query_prompt_after: str = "Task: Guess you answer with several words. Directly say the words without explanation.",
+    caching: bool = True,
+    num_next_tokens: int = 5,
+    num_beams_doc: int = 1,
+    num_beams_query: int = 1,
     dtype: torch.dtype = torch.bfloat16,
 ):
     doc_model, eval_tokenizer = get_llm_and_tokenizer(
@@ -344,6 +376,10 @@ def get_fbsearch_transformer(
         eval_tokenizer=eval_tokenizer,
         query_format=query_format,
         doc_format=doc_format,
+        caching=caching,
+        num_next_tokens=num_next_tokens,
+        num_beams_doc=num_beams_doc,
+        num_beams_query=num_beams_query,
     )
     return fbsearch_transformer
 

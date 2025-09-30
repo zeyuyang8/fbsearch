@@ -5,11 +5,13 @@ import os
 from dataclasses import dataclass, field
 from functools import partial
 
+import pandas as pd
 import transformers.utils.logging as transformers_utils_logging
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import (
     DistributedDataParallelKwargs,
+    gather_object,
     ProjectConfiguration,
     set_seed,
 )
@@ -54,11 +56,18 @@ class FBSearchTrainingArguments:
     seed: int = field(default=0)
 
     # Logging
-    logging_dir: str = field(default="logs")
-    tracker_name: str = field(default="tiny")
-    run_name: str = field(default="many2many")
-    run_tags: list[str] = field(default_factory=list)
     output_dir: str = field(default="runs")
+    logging_dir: str = field(default="logs")
+    tracker_name: str = field(default="supertiny")
+    run_tags: list[str] = field(default_factory=list)
+    run_name: str = field(default="many2many")
+
+    # Store
+    num_next_tokens: int = field(default=5)
+    num_beams_doc: int = field(default=1)
+    num_beams_query: int = field(default=2)
+    insertion_depth: int = field(default=5)
+    caching: bool = field(default=True)
 
     # Dataloader
     dataloader_num_workers: int = field(default=4)
@@ -290,6 +299,7 @@ class FBSearchTrainer:
                         eval_dataloader,
                         global_step=global_step,
                     )
+
         # End training
         accelerator.wait_for_everyone()
         accelerator.end_training()
@@ -474,11 +484,15 @@ class FBSearchTrainer:
         return loss, logs
 
     def evaluate(self, corpus_dataloader, eval_dataloader, **kwargs):
+        args = self.args
         global_step = kwargs.get("global_step", None)
-        accelerator = self.accelerator
+        accelerator: Accelerator = self.accelerator
 
         if accelerator.is_main_process:
-            store = PrefixTreeStore(self.transformer, insertion_depth=5)
+            store = PrefixTreeStore(
+                self.transformer,
+                insertion_depth=args.insertion_depth,
+            )
 
         for batch in corpus_dataloader:
             doc_ids = batch["doc_id"]
@@ -486,10 +500,11 @@ class FBSearchTrainer:
             genxs, tokens = self.transformer.index_doc(contents)
 
             # Gather results from all processes
-            ga_doc_ids = accelerator.gather_for_metrics(doc_ids)
-            ga_contents = accelerator.gather_for_metrics(contents)
-            ga_genxs = accelerator.gather_for_metrics(genxs)
-            ga_tokens = accelerator.gather_for_metrics(tokens)
+            ga_doc_ids = gather_object(doc_ids)
+            ga_contents = gather_object(contents)
+            # need to use `gather` here in case batch size is 1
+            ga_genxs = accelerator.gather(genxs)
+            ga_tokens = gather_object(tokens)
 
             if accelerator.is_main_process:
                 store.insert(
@@ -501,8 +516,7 @@ class FBSearchTrainer:
         if accelerator.is_main_process:
             plot_path = os.path.join(args.output_dir, "frequencies.pdf")
             if not self.plotted:
-                token_stats, stats_fig = store.plot_list_frequencies(
-                    store.data_store,
+                token_stats, stats_fig = store.plot_token_frequencies(
                     save_path=plot_path,
                 )
                 self.plotted = True
@@ -533,10 +547,10 @@ class FBSearchTrainer:
             genxs, tokens = self.transformer.index_query(queries)
 
             # Gather results from all processes
-            ga_doc_ids = accelerator.gather_for_metrics(doc_ids)
-            ga_queries = accelerator.gather_for_metrics(queries)
-            ga_genxs = accelerator.gather_for_metrics(genxs)
-            ga_tokens = accelerator.gather_for_metrics(tokens)
+            ga_doc_ids = gather_object(doc_ids)
+            ga_queries = gather_object(queries)
+            ga_genxs = accelerator.gather(genxs)
+            ga_tokens = gather_object(tokens)
 
             if accelerator.is_main_process:
                 ga_results = store.query(ga_queries, ga_genxs, ga_tokens)
@@ -549,10 +563,16 @@ class FBSearchTrainer:
             all_results, metrics = store.results2metrics(all_doc_ids, all_results)
             self.accelerator.log(metrics, step=global_step)
 
+            metrics = pd.DataFrame([metrics])
+            metrics.to_csv(
+                os.path.join(args.output_dir, f"metrics-{global_step}.csv"),
+                index=False,
+            )
+
 
 if __name__ == "__main__":
-    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --run_name many2many --run_tags tiny`
-    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --run_name one2one --run_tags tiny`
+    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --tracker_name supertiny --run_name many2many --run_tags many2many tiny`
+    # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --tracker_name supertiny --run_name one2one --run_tags one2one tiny`
 
     parser = HfArgumentParser((FBSearchTrainingArguments))
     (args,) = parser.parse_args_into_dataclasses()
@@ -573,6 +593,10 @@ if __name__ == "__main__":
         doc_prompt_after=args.doc_prompt_after,
         query_prompt_before=args.query_prompt_before,
         query_prompt_after=args.query_prompt_after,
+        caching=args.caching,
+        num_next_tokens=args.num_next_tokens,
+        num_beams_doc=args.num_beams_doc,
+        num_beams_query=args.num_beams_query,
     )
 
     trainer = FBSearchTrainer(

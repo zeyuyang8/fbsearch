@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
 
-from ..model.llama import FBSearchTransformer
-from ..model.prompt import PromptFormat
+from fbsearch.model.llama import FBSearchTransformer
+from fbsearch.model.prompt import PromptFormat
+from torch.utils.data import DataLoader, Dataset
 
 DEBUG = os.environ.get("DEBUG", False)
 plt.rcParams["font.family"] = "DejaVu Sans"
@@ -187,17 +187,26 @@ class PrefixTreeStore:
         if isinstance(genxs, torch.Tensor):
             genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
 
+        num_beams_doc = self.transformer.num_beams_doc
+
         for i in range(len(doc_ids)):
             doc_id = doc_ids[i]
             content = contents[i]
-            genx = genxs[i]
-            token = tokens[i]
+            start = i * num_beams_doc
+            end = (i + 1) * num_beams_doc
+            genx_beams = genxs[start:end]
+            token_beams = tokens[start:end]
 
             # Put into the data store
-            self.data_store[doc_id] = {"content": content, "genx": genx, "token": token}
+            self.data_store[doc_id] = {
+                "content": content,
+                "genx": genx_beams,
+                "token": token_beams,
+            }
 
             # Insert into the prefix tree
-            self.traverse_and_insert(genx, doc_id)
+            for genx in genx_beams:
+                self.traverse_and_insert(genx, doc_id)
 
     def traverse_and_insert(self, genx: np.array, doc_id: int):
         assert len(genx.shape) == 1
@@ -216,12 +225,26 @@ class PrefixTreeStore:
             genxs, tokens = self.transformer.index_query(queries)
         if isinstance(genxs, torch.Tensor):
             genxs = genxs.cpu().numpy().astype(int)  # 2D numpy array
+
+        num_beams_query = self.transformer.num_beams_query
+
         results = []
         for i in range(len(queries)):
             genx = genxs[i]
-            result = self.traverse_and_search(genx)
-            result["genx"] = genxs[i]
-            result["token"] = tokens[i]
+
+            start = i * num_beams_query
+            end = (i + 1) * num_beams_query
+            genx_beams = genxs[start:end]
+            token_beams = tokens[start:end]
+
+            result = {}
+            result["found"] = []
+            for genx in genx_beams:
+                depth, found_doc_ids = self.traverse_and_search(genx)
+                result["found"].append({"depth": depth, "doc_ids": found_doc_ids})
+
+            result["genx"] = genx_beams
+            result["token"] = token_beams
             results.append(result)
         return results
 
@@ -236,8 +259,11 @@ class PrefixTreeStore:
         for idx in range(len(results)):
             result = results[idx]
             labels = doc_ids[idx]
+            found = result["found"]
+            doc_ids_pred = set()
+            for item in found:
+                doc_ids_pred.update(item["doc_ids"])
 
-            doc_ids_pred: list[int] = result["doc_ids"]
             total_pred += len(doc_ids_pred)
 
             doc_ids_true: list[int] = labels
@@ -294,20 +320,20 @@ class PrefixTreeStore:
             depth += 1
 
         if found:
-            return {"depth": depth, "doc_ids": node.doc_ids}
-        return {"depth": -1, "doc_ids": set({})}
+            return depth, node.doc_ids
+        return -1, set({})
 
-    @staticmethod
-    def plot_list_frequencies(
-        data_store,
+    def plot_token_frequencies(
+        self,
         figsize=(12, 8),
         show_top_n=10,
         save_path=None,
     ):
         # Extract all tokens from the data store
         all_tokens = []
-        for result_dict in data_store.values():
-            all_tokens.append(result_dict["token"])
+        for result_dict in self.data_store.values():
+            for token in result_dict["token"]:
+                all_tokens.append(token)
 
         if not all_tokens:
             print("No data found in the input dictionary.")
@@ -414,17 +440,24 @@ class PrefixTreeStore:
         return stats, fig
 
 
-def text_to_int_list(texts, n=5, num_range=10):
+def text_to_int_list(texts, n=5, num_range=10, num_beams=1):
     if not isinstance(texts, list):
         texts = [texts]
 
     results = []
     for text in texts:
-        # Hash the input text using SHA256
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
-        # Convert the first n bytes to integers in the desired range
-        hashcode = [digest[i] % num_range for i in range(n)]
-        results.append(hashcode)
+        beams = []
+        for beam_idx in range(num_beams):
+            beam_text = f"{text}_beam_{beam_idx}"
+            # Add beam index to create different hashes for each beam
+            beam_text = f"{text}_beam_{beam_idx}"
+            # Hash the input text using SHA256
+            digest = hashlib.sha256(beam_text.encode("utf-8")).digest()
+            # Convert the first n bytes to integers in the desired range
+            hashcode = [digest[i] % num_range for i in range(n)]
+            beams.append(hashcode)
+
+        results += beams
 
     return results
 
@@ -436,15 +469,22 @@ class HashTransformer:
         num_range=4,
         query_format: PromptFormat = None,
         doc_format: PromptFormat = None,
+        num_beams_doc=1,
+        num_beams_query=1,
     ):
         self.n = n
         self.num_range = num_range
         self.query_format = query_format
         self.doc_format = doc_format
+        self.num_beams_doc = num_beams_doc
+        self.num_beams_query = num_beams_query
 
-    def index(self, prompts) -> tuple[np.array, list[str]]:
+    def index(self, prompts, num_beams: int) -> tuple[np.array, list[str]]:
         pred_tokens_padded = text_to_int_list(
-            prompts, n=self.n, num_range=self.num_range
+            prompts,
+            n=self.n,
+            num_range=self.num_range,
+            num_beams=num_beams,
         )
         decoded_tokens_list = []
         for pred_tokens in pred_tokens_padded:
@@ -457,12 +497,13 @@ class HashTransformer:
         if self.doc_format is not None:
             docs = self.doc_format.format(docs)
 
-        return self.index(docs)
+        return self.index(docs, self.num_beams_doc)
 
     def index_query(self, queries):
         if self.query_format is not None:
             queries = self.query_format.format(queries)
-        return self.index(queries)
+
+        return self.index(queries, self.num_beams_query)
 
 
 def _test_prefix_tree_store():
@@ -472,7 +513,14 @@ def _test_prefix_tree_store():
     corpus_data = datas["corpus"]
 
     # Test using a simple hash transformer
-    def test_insert_and_query(n, num_range, insertion_depth, msg):
+    def test_insert_and_query(
+        n,
+        num_range,
+        insertion_depth,
+        msg,
+        num_beams_doc=1,
+        num_beams_query=1,
+    ):
         specs = f"n={n}, num_range={num_range}, insertion_depth={insertion_depth}"
         print(colored("#" * 100, "grey"))
         print(colored(msg, "green"))
@@ -480,7 +528,12 @@ def _test_prefix_tree_store():
         print(colored("#" * 100, "grey"))
         print()
 
-        fbsearch_transformer = HashTransformer(n=n, num_range=num_range)
+        fbsearch_transformer = HashTransformer(
+            n=n,
+            num_range=num_range,
+            num_beams_doc=num_beams_doc,
+            num_beams_query=num_beams_query,
+        )
 
         # Test on the sample dataset
         prefix_store = PrefixTreeStore(
@@ -502,7 +555,9 @@ def _test_prefix_tree_store():
             doc_ids,
         )
         print("True:", doc_ids)
-        print("Pred:", results)
+        print("Pred:")
+        for result in results:
+            print(result)
         print(colored(f"Stat: {metrics}", "red"))
         print()
 
@@ -511,6 +566,8 @@ def _test_prefix_tree_store():
         num_range=2,
         insertion_depth=5,
         msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **NOT** DIVERSE",
+        num_beams_doc=1,
+        num_beams_query=1,
     )
 
     test_insert_and_query(
@@ -518,6 +575,8 @@ def _test_prefix_tree_store():
         num_range=10,
         insertion_depth=5,
         msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE",
+        num_beams_doc=1,
+        num_beams_query=1,
     )
 
     test_insert_and_query(
@@ -525,6 +584,17 @@ def _test_prefix_tree_store():
         num_range=10,
         insertion_depth=1,
         msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE BUT THE INSERTION DEPTH IS SHALLOW",
+        num_beams_doc=1,
+        num_beams_query=1,
+    )
+
+    test_insert_and_query(
+        n=5,
+        num_range=10,
+        insertion_depth=5,
+        msg="SIMULATE THE CASE WHERE THE GENERATED TOKENS ARE **YES** DIVERSE",
+        num_beams_doc=5,
+        num_beams_query=5,
     )
 
 
