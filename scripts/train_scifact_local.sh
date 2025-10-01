@@ -10,7 +10,7 @@ torchrun --nproc_per_node=2 train_scifact.py \
     --run_name scifact \
     --output_dir ../runs/scifact \
     --num_beams_query 5 \
-    --per_device_train_batch_size 16 \
-    --per_device_eval_batch_size 4 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 8 \
     --lr_warmup_steps 50 \
     --num_train_epochs 20

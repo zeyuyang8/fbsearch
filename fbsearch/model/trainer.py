@@ -95,24 +95,27 @@ class FBSearchTrainingArguments:
 class FBSearchTrainer:
     def __init__(
         self,
-        transformer: FBSearchTransformer = None,
-        args: FBSearchTrainingArguments = None,
-        train_dataset: Dataset = None,
-        eval_dataset: Dataset = None,
-        corpus_dataset: Dataset = None,
-        train_collate_fn=None,
-        eval_collate_fn=None,
+        transformer: FBSearchTransformer,
+        args: FBSearchTrainingArguments,
+        corpus_dataset: Dataset,
+        query2doc_dataset: Dataset,
+        query_train_dataset: Dataset = None,
+        query_dev_dataset: Dataset = None,
         corpus_collate_fn=None,
+        query2doc_collate_fn=None,
+        query_collate_fn=None,
     ):
         self.transformer = transformer
         self.args = args
 
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
-        self.train_collate_fn = train_collate_fn
-        self.eval_collate_fn = eval_collate_fn
         self.corpus_dataset = corpus_dataset
+        self.query2doc_dataset = query2doc_dataset
+        self.query_train_dataset = query_train_dataset
+        self.query_dev_dataset = query_dev_dataset
+
         self.corpus_collate_fn = corpus_collate_fn
+        self.query2doc_collate_fn = query2doc_collate_fn
+        self.query_collate_fn = query_collate_fn
 
     def init_accelerator(self):
         # Arguments
@@ -149,13 +152,13 @@ class FBSearchTrainer:
         set_seed(args.seed + accelerator.process_index)
         return accelerator
 
-    def _get_train_sampler(self, train_dataset) -> RandomSampler:
-        return RandomSampler(train_dataset)
+    def _get_train_sampler(self, query2doc_dataset) -> RandomSampler:
+        return RandomSampler(query2doc_dataset)
 
-    def _get_eval_sampler(self, eval_dataset) -> SequentialSampler | None:
+    def _get_eval_sampler(self, query_dataset) -> SequentialSampler | None:
         accelerator = self.accelerator
         if accelerator.num_processes <= 1:
-            return SequentialSampler(eval_dataset)
+            return SequentialSampler(query_dataset)
         else:
             return None
 
@@ -187,30 +190,28 @@ class FBSearchTrainer:
         dataloader = accelerator.prepare(DataLoader(dataset, **dataloader_params))
         return dataloader
 
-    def get_train_dataloader(self) -> DataLoader:
+    def get_query2doc_dataloader(self) -> DataLoader:
         args = self.args
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
+        if self.query2doc_dataset is None:
+            raise ValueError("Trainer: training requires a query2doc_dataset.")
 
         return self._get_dataloader(
-            dataset=self.train_dataset,
+            dataset=self.query2doc_dataset,
             batch_size=args.per_device_train_batch_size,
             sampler_fn=self._get_train_sampler,
             is_training=True,
-            collate_fn=self.train_collate_fn,
+            collate_fn=self.query2doc_collate_fn,
         )
 
-    def get_eval_dataloader(self) -> DataLoader:
+    def get_query_dataloader(self, query_dataset) -> DataLoader:
         args = self.args
-        if self.eval_dataset is None:
-            raise ValueError("Trainer: evaluation requires a eval_dataset.")
 
         return self._get_dataloader(
-            dataset=self.eval_dataset,
+            dataset=query_dataset,
             batch_size=args.per_device_eval_batch_size,
             sampler_fn=self._get_eval_sampler,
             is_training=False,
-            collate_fn=self.eval_collate_fn,
+            collate_fn=self.query_collate_fn,
         )
 
     def get_corpus_dataloader(self) -> DataLoader:
@@ -226,7 +227,7 @@ class FBSearchTrainer:
             collate_fn=self.corpus_collate_fn,
         )
 
-    def train(self):
+    def train(self, query_datasets: dict[str | Dataset] = None):
         args: FBSearchTrainingArguments = self.args
         self.plotted = False
 
@@ -237,7 +238,7 @@ class FBSearchTrainer:
         accelerator: Accelerator = self.init_accelerator()
 
         # Datasets for train (query-> doc), and eval (query-> doc)
-        self.train_dataloader = self.get_train_dataloader()
+        self.train_dataloader = self.get_query2doc_dataloader()
 
         # Create optimizer and scheduler
         train_configs = self.create_optimizer_and_scheduler()
@@ -290,19 +291,115 @@ class FBSearchTrainer:
 
             # Validate
             if epoch % args.validation_epochs == 0:
-                if self.eval_dataset is not None and self.corpus_dataset is not None:
-                    corpus_dataloader = self.get_corpus_dataloader()
-                    eval_dataloader = self.get_eval_dataloader()
+                if query_datasets is None:
+                    query_datasets = {}
+                    if self.query_train_dataset is not None:
+                        query_datasets["train"] = self.query_train_dataset
+                    if self.query_dev_dataset is not None:
+                        query_datasets["dev"] = self.query_dev_dataset
 
+                for flag, query_dataset in query_datasets.items():
                     self.evaluate(
-                        corpus_dataloader,
-                        eval_dataloader,
+                        query_dataset,
+                        flag=flag,
                         global_step=global_step,
                     )
 
         # End training
         accelerator.wait_for_everyone()
         accelerator.end_training()
+
+    def evaluate(self, query_dataset, flag: str, **kwargs):
+        args = self.args
+        global_step = kwargs.get("global_step", None)
+        accelerator: Accelerator = self.accelerator
+
+        if not hasattr(self, "corpus_dataloader"):
+            self.corpus_dataloader = self.get_corpus_dataloader()
+
+        query_dataloader = self.get_query_dataloader(query_dataset)
+
+        if accelerator.is_main_process:
+            store = PrefixTreeStore(
+                self.transformer,
+                insertion_depth=args.insertion_depth,
+            )
+
+        for batch in self.corpus_dataloader:
+            doc_ids = batch["doc_id"]
+            contents = batch["content"]
+            genxs, tokens = self.transformer.index_doc(contents)
+
+            # Gather results from all processes
+            ga_doc_ids = gather_object(doc_ids)
+            ga_contents = gather_object(contents)
+            # need to use `gather` here in case batch size is 1
+            ga_genxs = accelerator.gather(genxs)
+            ga_tokens = gather_object(tokens)
+
+            if accelerator.is_main_process:
+                store.insert(
+                    {"doc_id": ga_doc_ids, "content": ga_contents},
+                    ga_genxs,
+                    ga_tokens,
+                )
+
+        if accelerator.is_main_process:
+            plot_path = os.path.join(args.output_dir, "frequencies.pdf")
+            if not self.plotted:
+                token_stats, stats_fig = store.plot_token_frequencies(
+                    save_path=plot_path,
+                )
+                self.plotted = True
+
+                # Find wandb tracker and log table
+                wandb_tracker = next(
+                    (t for t in self.accelerator.trackers if t.name == "wandb"), None
+                )
+                if wandb_tracker:
+                    import wandb
+
+                    wandb_tracker.log(
+                        {
+                            "token_freq_fig": wandb.Image(
+                                stats_fig, caption="Token Frequency"
+                            )
+                        },
+                        commit=False,  # Don't create/advance to new step
+                    )
+
+        if accelerator.is_main_process:
+            all_doc_ids = []
+            all_results = []
+
+        for batch in query_dataloader:
+            doc_ids = batch["doc_id"]
+            queries = batch["query"]
+            genxs, tokens = self.transformer.index_query(queries)
+
+            # Gather results from all processes
+            ga_doc_ids = gather_object(doc_ids)
+            ga_queries = gather_object(queries)
+            ga_genxs = accelerator.gather(genxs)
+            ga_tokens = gather_object(tokens)
+
+            if accelerator.is_main_process:
+                ga_results = store.query(ga_queries, ga_genxs, ga_tokens)
+                all_doc_ids += ga_doc_ids
+                all_results += ga_results
+
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process:
+            all_results, metrics = store.results2metrics(all_doc_ids, all_results)
+            log_metrics = {f"{flag}:{k}": v for k, v in metrics.items()}
+            self.accelerator.log(log_metrics, step=global_step)
+
+            metrics = pd.DataFrame([metrics])
+            metrics.to_csv(
+                os.path.join(args.output_dir, f"{flag}-metrics-{global_step}.csv"),
+                index=False,
+            )
 
     def resume_from_checkpoint(self, num_update_steps_per_epoch):
         args = self.args
@@ -485,92 +582,6 @@ class FBSearchTrainer:
 
         return loss, logs
 
-    def evaluate(self, corpus_dataloader, eval_dataloader, **kwargs):
-        args = self.args
-        global_step = kwargs.get("global_step", None)
-        accelerator: Accelerator = self.accelerator
-
-        if accelerator.is_main_process:
-            store = PrefixTreeStore(
-                self.transformer,
-                insertion_depth=args.insertion_depth,
-            )
-
-        for batch in corpus_dataloader:
-            doc_ids = batch["doc_id"]
-            contents = batch["content"]
-            genxs, tokens = self.transformer.index_doc(contents)
-
-            # Gather results from all processes
-            ga_doc_ids = gather_object(doc_ids)
-            ga_contents = gather_object(contents)
-            # need to use `gather` here in case batch size is 1
-            ga_genxs = accelerator.gather(genxs)
-            ga_tokens = gather_object(tokens)
-
-            if accelerator.is_main_process:
-                store.insert(
-                    {"doc_id": ga_doc_ids, "content": ga_contents},
-                    ga_genxs,
-                    ga_tokens,
-                )
-
-        if accelerator.is_main_process:
-            plot_path = os.path.join(args.output_dir, "frequencies.pdf")
-            if not self.plotted:
-                token_stats, stats_fig = store.plot_token_frequencies(
-                    save_path=plot_path,
-                )
-                self.plotted = True
-
-                # Find wandb tracker and log table
-                wandb_tracker = next(
-                    (t for t in self.accelerator.trackers if t.name == "wandb"), None
-                )
-                if wandb_tracker:
-                    import wandb
-
-                    wandb_tracker.log(
-                        {
-                            "token_freq_fig": wandb.Image(
-                                stats_fig, caption="Token Frequency"
-                            )
-                        },
-                        commit=False,  # Don't create/advance to new step
-                    )
-
-        if accelerator.is_main_process:
-            all_doc_ids = []
-            all_results = []
-
-        for batch in eval_dataloader:
-            doc_ids = batch["doc_id"]
-            queries = batch["query"]
-            genxs, tokens = self.transformer.index_query(queries)
-
-            # Gather results from all processes
-            ga_doc_ids = gather_object(doc_ids)
-            ga_queries = gather_object(queries)
-            ga_genxs = accelerator.gather(genxs)
-            ga_tokens = gather_object(tokens)
-
-            if accelerator.is_main_process:
-                ga_results = store.query(ga_queries, ga_genxs, ga_tokens)
-                all_doc_ids += ga_doc_ids
-                all_results += ga_results
-
-        accelerator.wait_for_everyone()
-
-        if accelerator.is_main_process:
-            all_results, metrics = store.results2metrics(all_doc_ids, all_results)
-            self.accelerator.log(metrics, step=global_step)
-
-            metrics = pd.DataFrame([metrics])
-            metrics.to_csv(
-                os.path.join(args.output_dir, f"metrics-{global_step}.csv"),
-                index=False,
-            )
-
 
 if __name__ == "__main__":
     # `torchrun --nproc_per_node=2 -m fbsearch.model.trainer --tracker_name supertiny --run_name many2many --run_tags many2many tiny`
@@ -584,10 +595,10 @@ if __name__ == "__main__":
     elif args.run_name.startswith("one2one"):
         query_type = "one2one"
     datas = get_sample_datasets(query_type=query_type)
-    train_dataset = datas["query2doc_dataset"]
-    train_collate_fn = datas["query2doc_collate_fn"]
-    eval_dataset = datas["query_dataset"]
-    eval_collate_fn = datas["query_collate_fn"]
+    query2doc_dataset = datas["query2doc_dataset"]
+    query2doc_collate_fn = datas["query2doc_collate_fn"]
+    query_dataset = datas["query_dataset"]
+    query_collate_fn = datas["query_collate_fn"]
     corpus_dataset = datas["corpus_dataset"]
     corpus_collate_fn = datas["corpus_collate_fn"]
 
@@ -608,11 +619,16 @@ if __name__ == "__main__":
     trainer = FBSearchTrainer(
         transformer=transformer,
         args=args,
-        train_dataset=train_dataset,
-        train_collate_fn=train_collate_fn,
-        eval_dataset=eval_dataset,
-        eval_collate_fn=eval_collate_fn,
+        # Corpus dataset
         corpus_dataset=corpus_dataset,
+        # Query2doc dataset for training
+        query2doc_dataset=query2doc_dataset,
+        # Query dataset for evaluation
+        query_train_dataset=query_dataset,
+        query_dev_dataset=None,
+        # Collate functions
         corpus_collate_fn=corpus_collate_fn,
+        query2doc_collate_fn=query2doc_collate_fn,
+        query_collate_fn=query_collate_fn,
     )
     trainer.train()

@@ -35,11 +35,12 @@ if __name__ == "__main__":
     corpus_dataset = datas["corpus_dataset"]
     corpus_collate_fn = datas["corpus_collate_fn"]
 
-    train_dataset = datas["query2doc_dataset"]
-    train_collate_fn = datas["query2doc_collate_fn"]
+    query2doc_dataset = datas["query2doc_dataset"]
+    query2doc_collate_fn = datas["query2doc_collate_fn"]
 
-    eval_dataset = datas["query_train_dataset"]
-    eval_collate_fn = datas["query_train_collate_fn"]
+    query_train_dataset = datas["query_train_dataset"]
+    query_dev_dataset = datas["query_dev_dataset"]
+    query_collate_fn = datas["query_collate_fn"]
 
     transformer = get_fbsearch_transformer(
         doc_model_name_or_path=args.doc_model_name_or_path,
@@ -58,11 +59,16 @@ if __name__ == "__main__":
     trainer = FBSearchTrainer(
         transformer=transformer,
         args=args,
-        train_dataset=train_dataset,
-        train_collate_fn=train_collate_fn,
-        eval_dataset=eval_dataset,
-        eval_collate_fn=eval_collate_fn,
+        # Corpus dataset
         corpus_dataset=corpus_dataset,
+        # Query2doc dataset for training
+        query2doc_dataset=query2doc_dataset,
+        # Query dataset for evaluation
+        query_train_dataset=query_train_dataset,
+        query_dev_dataset=query_dev_dataset,
+        # Collate functions
         corpus_collate_fn=corpus_collate_fn,
+        query2doc_collate_fn=query2doc_collate_fn,
+        query_collate_fn=query_collate_fn,
     )
     trainer.train()

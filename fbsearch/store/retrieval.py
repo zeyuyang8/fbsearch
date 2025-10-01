@@ -146,10 +146,10 @@ def get_retrieval_datasets(
         "query2doc_collate_fn": query2doc_collate_fn,
         # Query for training
         "query_train_dataset": query_train_dataset,
-        "query_train_collate_fn": query_collate_fn,
         # Query for validation
         "query_dev_dataset": query_dev_dataset,
-        "query_dev_collate_fn": query_collate_fn,
+        # Collate functions for query
+        "query_collate_fn": query_collate_fn,
     }
 
 
