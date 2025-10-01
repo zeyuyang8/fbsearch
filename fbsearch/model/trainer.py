@@ -76,7 +76,7 @@ class FBSearchTrainingArguments:
     per_device_train_batch_size: int = field(default=1)
     per_device_eval_batch_size: int = field(default=5)
     lr_warmup_steps: int = field(default=0)
-    lr_scheduler: str = field(default="cosine_with_restarts")
+    lr_scheduler: str = field(default="cosine")
     gradient_accumulation_steps: int = field(default=1)
     num_train_epochs: int = field(default=10)
     learning_rate: float = field(default=2e-5)
@@ -86,7 +86,6 @@ class FBSearchTrainingArguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     validation_epochs: int = field(default=1)
-    lr_num_cycles: int = field(default=1)
 
     # Resume checkpoint
     resume_from_checkpoint: str = field(default=None)
@@ -350,9 +349,10 @@ class FBSearchTrainer:
         num_warmup_steps_for_scheduler = (
             args.lr_warmup_steps * accelerator.num_processes
         )
-        len_train_dataloader_after_sharding = math.ceil(
-            len(self.train_dataloader) / accelerator.num_processes
-        )
+
+        # Here, train_dataloader has already been prepared by the accelerator,
+        # otherwise, should do math.ceil(len(self.train_dataloader) / accelerator.num_processes)
+        len_train_dataloader_after_sharding = len(self.train_dataloader)
         num_update_steps_per_epoch = math.ceil(
             len_train_dataloader_after_sharding / args.gradient_accumulation_steps
         )
@@ -378,15 +378,12 @@ class FBSearchTrainer:
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
-        scheduler_specific_kwargs = {
-            "num_cycles": args.lr_num_cycles,
-        }
         lr_scheduler = get_scheduler(
             args.lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=num_warmup_steps_for_scheduler,
             num_training_steps=num_training_steps_for_scheduler,
-            scheduler_specific_kwargs=scheduler_specific_kwargs,
+            scheduler_specific_kwargs={"num_cycles": 0.5},
         )
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -582,7 +579,11 @@ if __name__ == "__main__":
     parser = HfArgumentParser((FBSearchTrainingArguments))
     (args,) = parser.parse_args_into_dataclasses()
 
-    datas = get_sample_datasets(query_type=args.run_name)
+    if args.run_name.startswith("many2many"):
+        query_type = "many2many"
+    elif args.run_name.startswith("one2one"):
+        query_type = "one2one"
+    datas = get_sample_datasets(query_type=query_type)
     train_dataset = datas["query2doc_dataset"]
     train_collate_fn = datas["query2doc_collate_fn"]
     eval_dataset = datas["query_dataset"]

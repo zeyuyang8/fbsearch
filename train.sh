@@ -11,7 +11,7 @@ for RUN_NAME in "${RUN_NAME_OPTIONS[@]}"; do
 
 torchrun --nproc_per_node=2 -m fbsearch.model.trainer \
     --tracker_name supertiny \
-    --run_name "$RUN_NAME" --run_tags "$RUN_NAME" tiny \
+    --run_name "$RUN_NAME"-circle-1 --run_tags "$RUN_NAME" tiny \
     --do_report true \
     --output_dir ./runs/tiny-"$RUN_NAME"
 
