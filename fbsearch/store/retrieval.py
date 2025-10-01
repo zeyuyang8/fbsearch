@@ -31,7 +31,7 @@ class CorpusDataset(Dataset):
 
     def __getitem__(self, i):
         doc_id = int(self.corpus.index[i])
-        content = self.corpus["content"][i]
+        content = self.corpus["content"][doc_id]
         return {
             "doc_id": int(doc_id),
             "content": content,
@@ -119,6 +119,37 @@ def query2doc_collate_fn(batch):
         "doc_id": doc_ids,
         "query": queries,
         "content": texts,
+    }
+
+
+def get_retrieval_datasets(
+    corpus_path,
+    query_train_path,
+    query_dev_path,
+):
+    corpus = pd.read_json(corpus_path, lines=True)
+    query_train = pd.read_json(query_train_path, lines=True)
+    query_dev = pd.read_json(query_dev_path, lines=True)
+
+    corpus_dataset = CorpusDataset(corpus)
+    query2doc_dataset = Query2DocumentDataset(query_train, corpus)
+
+    query_train_dataset = QueryDataset(query_train)
+    query_dev_dataset = QueryDataset(query_dev)
+
+    return {
+        # Corpus
+        "corpus_dataset": corpus_dataset,
+        "corpus_collate_fn": corpus_collate_fn,
+        # Query to document for training
+        "query2doc_dataset": query2doc_dataset,
+        "query2doc_collate_fn": query2doc_collate_fn,
+        # Query for training
+        "query_train_dataset": query_train_dataset,
+        "query_train_collate_fn": query_collate_fn,
+        # Query for validation
+        "query_dev_dataset": query_dev_dataset,
+        "query_dev_collate_fn": query_collate_fn,
     }
 
 
