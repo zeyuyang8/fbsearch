@@ -76,7 +76,7 @@ class FBSearchTrainingArguments:
     per_device_train_batch_size: int = field(default=1)
     per_device_eval_batch_size: int = field(default=5)
     lr_warmup_steps: int = field(default=0)
-    lr_scheduler: str = field(default="cosine")
+    lr_scheduler: str = field(default="cosine_with_restarts")
     gradient_accumulation_steps: int = field(default=1)
     num_train_epochs: int = field(default=10)
     learning_rate: float = field(default=2e-5)
@@ -86,6 +86,7 @@ class FBSearchTrainingArguments:
     adam_weight_decay: float = field(default=0.0)
     max_grad_norm: float = field(default=1.0)
     validation_epochs: int = field(default=1)
+    lr_num_cycles: int = field(default=1)
 
     # Resume checkpoint
     resume_from_checkpoint: str = field(default=None)
@@ -377,11 +378,15 @@ class FBSearchTrainer:
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
+        scheduler_specific_kwargs = {
+            "num_cycles": args.lr_num_cycles,
+        }
         lr_scheduler = get_scheduler(
             args.lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=num_warmup_steps_for_scheduler,
             num_training_steps=num_training_steps_for_scheduler,
+            scheduler_specific_kwargs=scheduler_specific_kwargs,
         )
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
