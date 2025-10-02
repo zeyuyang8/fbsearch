@@ -8,8 +8,14 @@ If on a devserver:
 with-proxy conda create --name fbsearch python=3.12
 conda activate fbsearch
 with-proxy conda install pip
-with-proxy pip install -r requirements.txt
+with-proxy pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
 with-proxy pip install -e . && rm -rf ./fbsearch.egg-info
+```
+
+Test if torch CUDA is installed:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 Or alternatively you can use:

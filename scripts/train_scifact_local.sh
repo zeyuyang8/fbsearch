@@ -1,6 +1,5 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=2,3
 export http_proxy=http://fwdproxy:8080
 export https_proxy=http://fwdproxy:8080
 export no_proxy=".fbcdn.net,.facebook.com,.thefacebook.com,.tfbnw.net,.fb.com,.fb"
