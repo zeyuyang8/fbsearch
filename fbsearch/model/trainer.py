@@ -1,3 +1,4 @@
+# @noautodeps
 import itertools
 import logging
 import math

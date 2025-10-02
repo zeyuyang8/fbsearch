@@ -1,3 +1,4 @@
+# @noautodeps
 import copy
 import os
 

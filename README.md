@@ -64,4 +64,14 @@ Convert your notebook to script:
 jupyter nbconvert --to python notebook.ipynb --PythonExporter.exclude_markdown=True --TagRemovePreprocessor.remove_cell_tags="['notebook_only']" --log-level ERROR
 ```
 
+### Avoiding `BUCK`
+
+Run this so that you don't have to run `buck build` every time you make a change to the code:
+
+```bash
+find . -name "*.py" -exec grep -L "@noautodeps" {} \; | while read file; do
+    sed -i '1i# @noautodeps' "$file"
+done
+```
+
 ### Setup Devserver/MAST/Manifold

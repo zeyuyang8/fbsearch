@@ -1,3 +1,4 @@
+# @noautodeps
 """
 NOTE: This is a temporary draft for processing the scifact dataset.
 """
