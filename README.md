@@ -69,8 +69,11 @@ jupyter nbconvert --to python notebook.ipynb --PythonExporter.exclude_markdown=T
 Run this so that you don't have to run `buck build` every time you make a change to the code:
 
 ```bash
-find . -name "*.py" -exec grep -L "@noautodeps" {} \; | while read file; do
-    sed -i '1i# @noautodeps' "$file"
+find . -name "*.py" -type f | while read file; do
+    if [[ ! -s "$file" ]] || [[ $(head -n 1 "$file") != "# @noautodeps" ]]; then
+        # Create temp file with header
+        { echo "# @noautodeps"; cat "$file" 2>/dev/null; } > "$file.tmp" && mv "$file.tmp" "$file"
+    fi
 done
 ```
 
