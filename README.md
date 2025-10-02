@@ -50,8 +50,12 @@ Do not set the above environment variables in your `.bashrc` file, as it will ca
 
 ## Useful Commands
 
+### Jupyter
+
 Convert your notebook to script:
 
 ```bash
 jupyter nbconvert --to python notebook.ipynb --PythonExporter.exclude_markdown=True --TagRemovePreprocessor.remove_cell_tags="['notebook_only']" --log-level ERROR
 ```
+
+### Setup Devserver/MAST/Manifold
